@@ -17,14 +17,6 @@ const options: Option[] = [
     buttonAriaLabel: 'Square',
     imageUrl: '/square.svg',
   },
-  {
-    buttonAriaLabel: 'Isosceles',
-    imageUrl: '/isosceles.svg',
-  },
-  {
-    buttonAriaLabel: 'Scalene',
-    imageUrl: '/scalene.svg',
-  }
 ];
 
 const showPrompt = ref(true);
@@ -80,10 +72,6 @@ window.addEventListener('keypress', (keyEvent) => {
     selectedIndex.value = ScopeShape.Equilateral;
   } else if (keyEvent.code == 'Digit2') {
     selectedIndex.value = ScopeShape.Square;
-  } else if (keyEvent.code == 'Digit3') {
-    selectedIndex.value = ScopeShape.Isosceles;
-  } else if (keyEvent.code == 'Digit4') {
-    selectedIndex.value = ScopeShape.Scalene;
   }
   if (keyEvent.code != 'KeyH') {
     return;

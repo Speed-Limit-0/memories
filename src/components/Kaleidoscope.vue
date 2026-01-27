@@ -247,83 +247,6 @@ async function main() {
         return k;
       }
 
-      vec2 isosceles(vec2 u, float kLength, float kRot, vec2 offset) {
-        // Center the triangle in a circle
-        u -= vec2(0.5, 0.5);
-
-        u = rotate2d(u,kRot);
-        u /= kLength;
-        u *= sqrt(2.0) / 2.0;
-
-        u += vec2(0.5, 0.5);
-        u -= 0.25;
-
-        u += offset;
-
-        vec2 k = vec2(0.0, 0.0);
-
-        vec2 squareCentroid = vec2(round(u.x), round(u.y));
-        // For debugging
-        // k = vec2(distance(squareCentroid, u));
-
-        float distance = distance(squareCentroid, u) * 2.0;
-        float deg180 = 3.1415926536;
-        float deg45 = deg180 / 4.0;
-        // Multiply by 0.99999, because atan2 fails on some corner cases :(
-        float theta = atan(u.x- squareCentroid.x, u.y- squareCentroid.y) * 0.999999;
-        if (mod(theta, deg45 * 2.0) > deg45) {
-          theta = deg45 - mod(theta, deg45);
-        } else {
-          theta = mod(theta, deg45);
-        }
-
-        k.x = cos(theta) * distance;
-        k.y = sin(theta) * distance;
-
-        return k;
-      }
-
-      vec2 scalene(vec2 u, float kLength, float kRot, vec2 offset) {
-        u -= 0.5;
-
-        u = rotate2d(u,kRot + radians(60.0));
-        u /= kLength;
-
-        u += 0.5;
-
-        u.x -= sin(radians(90.0)) * 0.50;
-        u.y -= cos(radians(90.0)) * 0.50;
-
-        u += offset;
-
-        vec2 k = vec2(0.0, 0.0);
-
-        vec2 hexIndex = square_float_to_axial_hex_grid(u, true);
-        vec2 hexCentroid = hexToCentroid(hexIndex, true);
-        // For debugging
-        // k = vec2(distance(hexToCentroid(hexIndex, true), u));
-        // k = hexIndex / 5.0;
-
-        float distance = distance(hexCentroid, u) * 2.0 / sqrt(3.0);
-        float deg180 = 3.1415926536;
-        float deg30 = deg180 / 6.0;
-        float theta = atan(u.x- hexCentroid.x, u.y- hexCentroid.y) + deg180;
-        if (mod(theta, deg30 * 2.0) > deg30) {
-          theta = mod(theta, deg30);
-        } else {
-          theta = deg30 - mod(theta, deg30);
-        }
-
-        k.x = cos(theta) * distance;
-        k.y = sin(theta) * distance;
-
-        // We want the center of the triangle to be the center of the image.
-        k *= sqrt(3.0) / 2.0;
-        k.x += (((1.0 - sqrt(3.0) / 2.0)) / 2.0);
-        k.y += (0.25);
-
-        return k;
-      }
 
       void main() {
           // The interesting things to change!
@@ -359,11 +282,6 @@ async function main() {
           } else if (scopeShape == ${ScopeShape.Square}) {
             k = square(k, scopeSize, scopeRotation, d);
             scopeDiameterRatio = sqrt(2.0);
-          } else if (scopeShape == ${ScopeShape.Isosceles}) {
-            k = isosceles(k, scopeSize, scopeRotation, d);
-          } else {
-            scopeDiameterRatio = 1.0;
-            k = scalene(k, scopeSize, scopeRotation, d);
           }
 
           // Calculate distance from edges of THIS reflection segment (using k coordinate)
@@ -388,28 +306,6 @@ async function main() {
           // Ensure smooth progressive transition (no sharp cutoffs)
           edgeFactor = smoothstep(0.0, 1.0, edgeFactor);
           
-          // Refraction/distortion at edges of each reflection - warp outward from segment center
-          // Distortion should ONLY apply at edges, not at center
-          // Create a distortion factor that's zero at center and increases toward edges
-          float distortionFactor = 1.0 - smoothstep(0.0, 0.4, distToNearestEdge); // Zero at center, 1 at edges
-          distortionFactor = pow(distortionFactor, 0.8); // Make it more edge-focused
-          
-          // Use a smoother distortion direction to avoid visible lines along diagonals
-          // Rotate the direction slightly to break up diagonal patterns
-          vec2 distortionDir = normalize(toSegmentCenter + vec2(0.001)); // Avoid division by zero
-          distortionDir = rotate2d(distortionDir, 0.1); // Slight rotation to smooth out diagonal lines
-          
-          // Reduce distortion for square-based shapes (Square and Isosceles) to avoid aggressive artifacts
-          float distortionMultiplier = 2.5;
-          if (scopeShape == ${ScopeShape.Square} || scopeShape == ${ScopeShape.Isosceles}) {
-            distortionMultiplier = 1.2; // Much less aggressive for square-based patterns
-          }
-          float distortionStrength = distortionFactor * distortionMultiplier;
-          // Scale by distance from center to make it stronger further from center
-          float distortionScale = smoothstep(0.3, maxSegmentDist, distFromSegmentCenter); // Start later to avoid center artifacts
-          // Apply smoother, more gradual distortion
-          vec2 distortedK = k + distortionDir * distortionStrength * distortionScale * smoothstep(0.0, 1.0, distFromSegmentCenter / maxSegmentDist);
-          
           // Now map the k value to coordinates on the image
           // 0,0 will be the centre of the image
           // 1,1 will be the top right of the image (not the bottom left– It's easier to orientate if things are up-right)
@@ -417,20 +313,52 @@ async function main() {
           float dataWindowSize = dataMinDimension * dataScopePercentage;
           vec2 i = vec2(0.0,0.0);
           // x-axis is flipped only when the camera is pointed to the user
-          i.x = (-dataWindowSize / 2.0 + distortedK.x * dataWindowSize) * (dataIsFacingUser == 1 ? -1.0 : 1.0);
+          i.x = (-dataWindowSize / 2.0 + k.x * dataWindowSize) * (dataIsFacingUser == 1 ? -1.0 : 1.0);
           // y-axis is flipped because of openGL coordinate space
-          i.y = - (-dataWindowSize / 2.0 + distortedK.y * dataWindowSize);
+          i.y = - (-dataWindowSize / 2.0 + k.y * dataWindowSize);
           i = rotate2d(i, scopeRotation * (dataIsFacingUser == 1 ? -1.0 : 1.0));
           i /= dataZoom;
           
-          // Chromatic aberration - sample RGB channels at slightly offset positions
-          // Offset direction is radial from segment center
-          float aberrationStrength = edgeFactor * 0.02; // Reduced aberration strength (in texture coordinate space)
-          vec2 aberrationDir = normalize(rotate2d(toSegmentCenter, scopeRotation) + vec2(0.001)); // Avoid division by zero
+          // Circular mask - calculate distance from center of screen
+          vec2 screenCenter = vec2(0.5, 0.5);
+          vec2 screenPos = vec2(fragCoord.x, 1.0 - fragCoord.y); // Account for flipped y-coordinate
+          float distFromCenter = distance(screenPos, screenCenter);
+          float circleRadius = 0.25; // Radius of the circle (smaller than half the screen)
+          // Hard edge cutoff - no smoothstep to eliminate halo completely
+          float circleMask = step(distFromCenter, circleRadius); // Hard edge, no transparency gradient
           
-          vec2 iR = i + aberrationDir * aberrationStrength * dataWindowSize;
-          vec2 iG = i;
-          vec2 iB = i - aberrationDir * aberrationStrength * dataWindowSize;
+          // Radial vignette for circular container - progressively darken towards edges
+          float normalizedDistFromCenter = distFromCenter / circleRadius; // Normalize to [0, 1] within circle
+          // Fade vignette out before the mask edge to prevent bright halo
+          // Stop vignette at 90% of radius so it fades before the mask transition
+          float vignetteEnd = 0.9; // Stop vignette at 90% of circle radius
+          float circleVignetteFactor = smoothstep(0.0, vignetteEnd, normalizedDistFromCenter); // Fade out before edge
+          float circleVignette = 1.0 - circleVignetteFactor * 0.5; // Reduced darkening (50% darker at vignette end)
+          circleVignette = max(circleVignette, 0.1); // Keep minimum brightness higher
+          
+          // Circular edge distortion - warp outward from circle center, stronger at edges
+          // Use a curve that's minimal in center but aggressive at edges
+          float circleDistortionFactor = smoothstep(0.0, 1.0, normalizedDistFromCenter); // Progressive from center to edge
+          circleDistortionFactor = pow(circleDistortionFactor, 8.0); // Very steep curve - stays near zero until very close to edges, then ramps up dramatically
+          
+          // Distortion direction is radial from circle center (outward)
+          vec2 circleDistortionDir = normalize(screenPos - screenCenter + vec2(0.001)); // Avoid division by zero
+          circleDistortionDir = rotate2d(circleDistortionDir, 0.1); // Slight rotation to smooth out patterns
+          
+          // Apply stronger distortion to texture coordinates based on circular container edge
+          // Distortion pushes outward from center, creating a "lens" or "fisheye" effect at edges
+          float circleDistortionStrength = circleDistortionFactor * 5.0; // Increased distortion strength
+          vec2 circleDistortionOffset = circleDistortionDir * circleDistortionStrength * dataWindowSize * 0.03;
+          
+          // Chromatic aberration - only apply at circular container edges
+          // Offset direction is radial from circle center (not segment center)
+          // Only apply aberration when inside the circular container
+          float aberrationStrength = circleDistortionFactor * circleMask * 0.02; // Reduced aberration strength (in texture coordinate space)
+          vec2 aberrationDir = normalize(rotate2d(screenPos - screenCenter, scopeRotation) + vec2(0.001)); // Avoid division by zero
+          
+          vec2 iR = i + circleDistortionOffset + aberrationDir * aberrationStrength * dataWindowSize;
+          vec2 iG = i + circleDistortionOffset;
+          vec2 iB = i + circleDistortionOffset - aberrationDir * aberrationStrength * dataWindowSize;
           
           iR.x += dataDimensions.x / 2.0;
           iR.y += dataDimensions.y / 2.0;
@@ -443,55 +371,54 @@ async function main() {
           vec2 texCoordG = clamp(vec2(iG.x, iG.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
           vec2 texCoordB = clamp(vec2(iB.x, iB.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
           
+          // Get original sharp color with chromatic aberration and circular edge distortion
           float r = texture2D(data, texCoordR).r;
           float g = texture2D(data, texCoordG).g;
           float b = texture2D(data, texCoordB).b;
           float a = texture2D(data, texCoordG).a;
           
-          // Vignetting - progressively darken edges of each reflection segment
-          // Radial vignette: darkens in a circular pattern from center outward
-          float vignetteFactor = smoothstep(0.0, maxSegmentDist, distFromSegmentCenter); // Radial distance from center
-          float vignette = 1.0 - vignetteFactor * 0.6; // Progressive darkening (60% darker at edges)
-          vignette = max(vignette, 0.05); // Keep minimum brightness
+          // Subtle blur - only at edges, gentle in center
+          float blurFactor = pow(circleDistortionFactor, 2.0); // Blur increases with distortion
+          float blurStrength = blurFactor * 0.008; // Small blur strength
           
-          // Progressive dimming based on tile distance from center
-          // This makes each reflection copy dimmer as it gets further from the center tile
-          // tileDistance represents how many tiles away from center we are
-          float dimmingFactor = smoothstep(0.0, 2.0, tileDistance); // Dim over first 2 tiles from center (starts earlier)
-          dimmingFactor = pow(dimmingFactor, 0.4); // Smoother, earlier falloff
-          
-          // Dim reflections based on tile distance - each copy gets darker
-          float dimming = 1.0 - dimmingFactor * 0.8; // Dim reflections (80% dimmer for distant tiles)
-          dimming = max(dimming, 0.2); // Keep minimum brightness (20% for very distant tiles)
-          
-          // Progressive blur based on tile distance (same as dimming)
-          // Blur strength increases as reflections get further from center
-          float blurFactor = smoothstep(0.0, 2.0, tileDistance); // Blur over first 2 tiles from center
-          blurFactor = pow(blurFactor, 0.4); // Same falloff as dimming
-          float blurStrength = blurFactor * 0.025; // Maximum blur strength (adjustable)
-          
-          // Sample texture at multiple offset positions for blur effect
-          vec2 texCoordCenter = vec2(iG.x, iG.y) / vec2(dataDimensions.x, dataDimensions.y);
-          vec2 blurOffset = vec2(blurStrength, 0.0);
-          
-          // Simple box blur - sample 9 points in a 3x3 grid
+          // Simple Gaussian blur - sample in a small grid pattern
+          vec2 texCoordCenter = texCoordG; // Use green channel as center
           vec3 blurredColor = vec3(0.0);
-          float sampleCount = 0.0;
-          for (float x = -1.0; x <= 1.0; x += 1.0) {
-            for (float y = -1.0; y <= 1.0; y += 1.0) {
-              vec2 offset = vec2(x, y) * blurStrength;
+          float totalWeight = 0.0;
+          
+          // Sample in a 3x3 grid for subtle blur
+          for (int x = -1; x <= 1; x++) {
+            for (int y = -1; y <= 1; y++) {
+              vec2 offset = vec2(float(x), float(y)) * blurStrength;
               vec2 sampleCoord = clamp(texCoordCenter + offset, 0.0, 1.0);
+              
+              // Gaussian weight
+              float dist = length(vec2(float(x), float(y)));
+              float weight = exp(-(dist * dist) / 0.5);
+              
               vec4 sample = texture2D(data, sampleCoord);
-              blurredColor += sample.rgb;
-              sampleCount += 1.0;
+              blurredColor += sample.rgb * weight;
+              totalWeight += weight;
             }
           }
-          blurredColor /= sampleCount;
           
-          // Blend between sharp and blurred based on blur strength
-          vec3 finalColor = mix(vec3(r, g, b), blurredColor, blurFactor);
+          if (totalWeight > 0.0) {
+            blurredColor /= totalWeight;
+          } else {
+            blurredColor = vec3(r, g, b);
+          }
           
-          gl_FragColor = vec4(finalColor * vignette * dimming, a);
+          // Blend between sharp and blurred - subtle blend
+          vec3 finalColor = mix(vec3(r, g, b), blurredColor, blurFactor * 0.6);
+          
+          // Limit reflections to main and adjacent tiles only (no infinite reflections)
+          // tileDistance < 0.5 = main reflection, 0.5 <= tileDistance < 1.5 = adjacent reflections
+          float maxTileDistance = 1.5; // Maximum tile distance to show
+          float tileMask = 1.0 - smoothstep(maxTileDistance - 0.1, maxTileDistance, tileDistance); // Smooth edge
+          
+          // Apply vignette (which now fades before mask edge) and mask
+          float combinedMask = circleMask * tileMask;
+          gl_FragColor = vec4(finalColor * circleVignette, a * combinedMask);
 
           // For debugging the kaleidoscope value
           // gl_FragColor=vec4(k.x, k.y, 0.0, 1.0);
@@ -587,20 +514,10 @@ async function main() {
     let scopeRotationOffset = 0;
     if (props.scopeShape === ScopeShape.Equilateral) {
       scopeRotationOffset = Math.PI / 3;
-    } else if (props.scopeShape === ScopeShape.Isosceles) {
-      scopeRotationOffset = -Math.PI / 2;
-    } else if (props.scopeShape === ScopeShape.Scalene) {
-      scopeRotationOffset = -Math.PI / 2;
     }
 
-    // A hack to fix an issue with the scope offset calculations for a specific shape...
-    if (props.scopeShape === ScopeShape.Scalene) {
-      scopeOffset.value[0] += Math.sin(-scopeRotation.value - scopeRotationOffset - Math.PI / 3) * scopeOffsetVel.value[0] - Math.cos(-scopeRotation.value - scopeRotationOffset - Math.PI / 3) * scopeOffsetVel.value[1];
-      scopeOffset.value[1] += Math.cos(-scopeRotation.value - scopeRotationOffset - Math.PI / 3) * scopeOffsetVel.value[0] + Math.sin(-scopeRotation.value - scopeRotationOffset - Math.PI / 3) * scopeOffsetVel.value[1];
-    } else {
-      scopeOffset.value[0] += Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] - Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
-      scopeOffset.value[1] += Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] + Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
-    }
+    scopeOffset.value[0] += Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] - Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
+    scopeOffset.value[1] += Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] + Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
 
     if (props.scopeAutoRotationVelocity !== 0) {
       scopeRotationVel.value = props.scopeAutoRotationVelocity / 25;
@@ -610,13 +527,7 @@ async function main() {
       scopeRotation.value += scopeRotationVel.value;
       scopeRotationVel.value *= 0.99;
       scopeSizeVel.value *= 0.95;
-      scopeSize.value *= 1 + Math.min(scopeSizeVel.value, 0.99);
-      if (scopeSize.value > 2.0) {
-        scopeSize.value -= (scopeSize.value - 2) / 10;
-      }
-      if (scopeSize.value < Math.pow(0.5, 7)) {
-        scopeSize.value += (Math.pow(0.5, 7) - scopeSize.value) / 10;
-      }
+      scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1 + Math.min(scopeSizeVel.value, 0.99))));
     }
     scopeOffsetVel.value[0] *= 0.95;
     scopeOffsetVel.value[1] *= 0.95;
@@ -723,7 +634,7 @@ function touchMoveCallback(event: TouchEvent) {
     scopeRotationVel.value = 0;
   }
 
-  scopeSize.value *= 1.0 + deltaY / 10;
+  scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 10)));
   if (Math.abs(touch.clientY - touchPrev1.clientY) > 1) {
     scopeSizeVel.value = deltaY / 10;
   } else {
@@ -787,7 +698,7 @@ onMounted(() => {
       scopeRotationVel.value = 0;
     }
 
-    scopeSize.value *= 1.0 + deltaY / 50;
+    scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 50)));
     if (Math.abs(mouseEvent.clientY - mousePrevPosition.y) > 1) {
       scopeSizeVel.value = deltaY / 50;
     } else {
@@ -811,7 +722,7 @@ onMounted(() => {
   document.addEventListener('wheel', (wheelEvent) => {
     wheelEvent.preventDefault();
     scopeRotation.value += wheelEvent.deltaX / 500;
-    scopeSize.value *= 1.0 - wheelEvent.deltaY / 500;
+    scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 - wheelEvent.deltaY / 500)));
   });
 
   canvasElement.addEventListener('touchstart', touchStartCallback);
@@ -909,8 +820,7 @@ watch(() => props.uploadedImage, async (newImage) => {
   <canvas
     id="maincanvas"
     ref="canvas"
-    class="bg-black"
-    style="width:100dvw;height:100dvh;object-fit:cover"
+    style="width:100dvw;height:100dvh;object-fit:cover;background-color:#EAEAE8"
   />
   <video
     id="camera"
