@@ -27,7 +27,7 @@ const showCapture = ref(false);
 const showControls = ref(true);
 const selectedIndex = ref(ScopeShape.Equilateral);
 const scopeAutoRotationVelocity = ref(0);
-const uploadedImage = ref(null as null|string);
+const uploadedImages = ref([] as string[]);
 const fileInputRef = useTemplateRef('file-input');
 function updateSelectedIndex (value: number) {
   selectedIndex.value = value;
@@ -50,16 +50,27 @@ function savedFrame(objectUrl: string) {
 
 const handleFileUpload = (event: Event) => {
   const target = event.target as HTMLInputElement;
-  const file = target.files?.[0];
-  if (file && file.type.startsWith('image/')) {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const result = e.target?.result;
-      if (typeof result === 'string') {
-        uploadedImage.value = result;
+  const files = target.files;
+  if (files && files.length > 0) {
+    const newImages: string[] = [];
+    let loadedCount = 0;
+    
+    Array.from(files).forEach((file) => {
+      if (file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const result = e.target?.result;
+          if (typeof result === 'string') {
+            newImages.push(result);
+            loadedCount++;
+            if (loadedCount === Array.from(files).filter(f => f.type.startsWith('image/')).length) {
+              uploadedImages.value = [...uploadedImages.value, ...newImages];
+            }
+          }
+        };
+        reader.readAsDataURL(file);
       }
-    };
-    reader.readAsDataURL(file);
+    });
   }
 };
 
@@ -100,7 +111,7 @@ onUpdated(() => {
     :scope-shape="selectedIndex"
     :scope-auto-rotation-velocity="scopeAutoRotationVelocity"
     :save-next-frame="saveNextFrame"
-    :uploaded-image="uploadedImage"
+    :uploaded-images="uploadedImages"
     @save-frame="savedFrame"
   />
   <div
@@ -170,6 +181,7 @@ onUpdated(() => {
         ref="file-input"
         type="file"
         accept="image/*"
+        multiple
         class="hidden"
         @change="handleFileUpload"
       >

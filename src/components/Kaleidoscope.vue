@@ -6,7 +6,7 @@ const props = defineProps<{
   scopeShape: ScopeShape,
   scopeAutoRotationVelocity: number
   saveNextFrame: boolean
-  uploadedImage?: string | null
+  uploadedImages?: string[]
 }>();
 
 const emit = defineEmits(['save-frame']);
@@ -33,30 +33,91 @@ const keyPressedL = ref(false);
 const keyPressedMinus = ref(false);
 const keyPressedPlus = ref(false);
 const canvas = useTemplateRef('canvas');
-const uploadedImageElement = ref(null as HTMLImageElement | null);
+const uploadedImageElements = ref([] as HTMLImageElement[]);
+const currentImageIndex = ref(0);
+const cumulativeRotation = ref(0.0);
+const previousRotation = ref(0.0);
+const rotationThreshold = Math.PI / 4; // Switch after 45 degrees (much less rotation needed)
+const lastSwitchTime = ref(0); // Track when we last switched to prevent rapid switching
+const maxRotationSpeed = 0.01; // Maximum rotation velocity
+const transitionProgress = ref(0.0);
+const isTransitioning = ref(false);
+const nextImageIndex = ref(0);
+const transitionStartTime = ref(0);
+const transitionDuration = 500; // Duration in milliseconds for smooth transition
+const rotationDirection = ref(1); // 1 for clockwise (forward), -1 for counter-clockwise (backward)
 let cameraStream: MediaStream | null = null;
-let textureNeedsUpdate = ref(true);
 
-const loadUploadedImage = async (imageSrc: string | null) => {
-  if (imageSrc) {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.src = imageSrc;
-    await new Promise((resolve, reject) => {
-      img.onload = resolve;
-      img.onerror = reject;
-    });
-    uploadedImageElement.value = img;
+const clampRotationVelocity = (velocity: number): number => {
+  return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
+};
+const textureNeedsUpdate = ref(true);
+let texture1: WebGLTexture | null = null;
+let texture2: WebGLTexture | null = null;
+
+// Maximum texture dimension to reduce upload time and prevent stuttering
+const MAX_TEXTURE_SIZE = 2048;
+
+// Resize image to maximum size while maintaining aspect ratio
+const resizeImage = (img: HTMLImageElement): Promise<HTMLImageElement> => {
+  return new Promise((resolve) => {
+    const maxDim = Math.max(img.width, img.height);
+    if (maxDim <= MAX_TEXTURE_SIZE) {
+      // Image is already small enough
+      resolve(img);
+      return;
+    }
+    
+    // Calculate new dimensions maintaining aspect ratio
+    const scale = MAX_TEXTURE_SIZE / maxDim;
+    const newWidth = Math.round(img.width * scale);
+    const newHeight = Math.round(img.height * scale);
+    
+    // Create canvas to resize image
+    const canvas = document.createElement('canvas');
+    canvas.width = newWidth;
+    canvas.height = newHeight;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0, newWidth, newHeight);
+    
+    // Create new image from resized canvas
+    const resizedImg = new Image();
+    resizedImg.crossOrigin = 'anonymous';
+    resizedImg.onload = () => resolve(resizedImg);
+    resizedImg.onerror = () => resolve(img); // Fallback to original if resize fails
+    resizedImg.src = canvas.toDataURL('image/jpeg', 0.92);
+  });
+};
+
+const loadUploadedImages = async (imageSrcs: string[]) => {
+  if (imageSrcs.length > 0) {
+    const loadedImages: HTMLImageElement[] = [];
+    for (const src of imageSrcs) {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = src;
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+      });
+      // Resize image to reduce upload time and prevent stuttering
+      const resizedImg = await resizeImage(img);
+      loadedImages.push(resizedImg);
+    }
+    uploadedImageElements.value = loadedImages;
+    currentImageIndex.value = 0;
+    cumulativeRotation.value = 0.0;
     facingMode.value = 'user'; // Default for uploaded images
     textureNeedsUpdate.value = true; // Mark texture for update
     
-    // Stop camera stream if image is uploaded
+    // Stop camera stream if images are uploaded
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
       cameraStream = null;
     }
   } else {
-    uploadedImageElement.value = null;
+    uploadedImageElements.value = [];
+    currentImageIndex.value = 0;
     textureNeedsUpdate.value = true; // Mark texture for update when switching back to camera
   }
 };
@@ -66,9 +127,9 @@ async function main() {
   // Adapted from p5js.org/examples/3d-shader-using-webcam.html
   const camera = document.getElementById('camera') as HTMLVideoElement;
 
-  // If an image is uploaded, create an image element for it
-  if (props.uploadedImage) {
-    await loadUploadedImage(props.uploadedImage);
+  // If images are uploaded, create image elements for them
+  if (props.uploadedImages && props.uploadedImages.length > 0) {
+    await loadUploadedImages(props.uploadedImages);
   } else {
     // Ask user permission to record their camera
     try {
@@ -118,7 +179,11 @@ async function main() {
       precision highp float;
 
       uniform sampler2D data;
+      uniform sampler2D data2;
+      uniform float transitionProgress;
+      uniform float rotationVelocity;
       uniform vec2 dataDimensions;
+      uniform vec2 dataDimensions2;
       uniform int dataIsFacingUser;
       uniform float dataZoom;
       uniform vec2 canvasDimensions;
@@ -321,8 +386,8 @@ async function main() {
           
           // Circular mask - calculate distance from center of screen
           vec2 screenCenter = vec2(0.5, 0.5);
-          vec2 screenPos = vec2(fragCoord.x, 1.0 - fragCoord.y); // Account for flipped y-coordinate
-          float distFromCenter = distance(screenPos, screenCenter);
+          vec2 screenPosForMask = vec2(fragCoord.x, 1.0 - fragCoord.y); // Account for flipped y-coordinate
+          float distFromCenter = distance(screenPosForMask, screenCenter);
           float circleRadius = 0.25; // Radius of the circle (smaller than half the screen)
           // Hard edge cutoff - no smoothstep to eliminate halo completely
           float circleMask = step(distFromCenter, circleRadius); // Hard edge, no transparency gradient
@@ -342,7 +407,7 @@ async function main() {
           circleDistortionFactor = pow(circleDistortionFactor, 8.0); // Very steep curve - stays near zero until very close to edges, then ramps up dramatically
           
           // Distortion direction is radial from circle center (outward)
-          vec2 circleDistortionDir = normalize(screenPos - screenCenter + vec2(0.001)); // Avoid division by zero
+          vec2 circleDistortionDir = normalize(screenPosForMask - screenCenter + vec2(0.001)); // Avoid division by zero
           circleDistortionDir = rotate2d(circleDistortionDir, 0.1); // Slight rotation to smooth out patterns
           
           // Apply stronger distortion to texture coordinates based on circular container edge
@@ -354,7 +419,7 @@ async function main() {
           // Offset direction is radial from circle center (not segment center)
           // Only apply aberration when inside the circular container
           float aberrationStrength = circleDistortionFactor * circleMask * 0.02; // Reduced aberration strength (in texture coordinate space)
-          vec2 aberrationDir = normalize(rotate2d(screenPos - screenCenter, scopeRotation) + vec2(0.001)); // Avoid division by zero
+          vec2 aberrationDir = normalize(rotate2d(screenPosForMask - screenCenter, scopeRotation) + vec2(0.001)); // Avoid division by zero
           
           vec2 iR = i + circleDistortionOffset + aberrationDir * aberrationStrength * dataWindowSize;
           vec2 iG = i + circleDistortionOffset;
@@ -371,45 +436,147 @@ async function main() {
           vec2 texCoordG = clamp(vec2(iG.x, iG.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
           vec2 texCoordB = clamp(vec2(iB.x, iB.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
           
-          // Get original sharp color with chromatic aberration and circular edge distortion
-          float r = texture2D(data, texCoordR).r;
-          float g = texture2D(data, texCoordG).g;
-          float b = texture2D(data, texCoordB).b;
-          float a = texture2D(data, texCoordG).a;
+          // Motion blur based on rotation velocity - apply in texture coordinate space
+          // Only apply motion blur when rotation is significant to save performance
+          float motionBlurStrength = abs(rotationVelocity) * 8.0; // Increased multiplier for visibility
+          motionBlurStrength = min(motionBlurStrength, 1.2); // Cap maximum blur
           
-          // Subtle blur - only at edges, gentle in center
-          float blurFactor = pow(circleDistortionFactor, 2.0); // Blur increases with distortion
-          float blurStrength = blurFactor * 0.008; // Small blur strength
+          vec3 color1R, color1G, color1B;
+          float a1;
           
-          // Simple Gaussian blur - sample in a small grid pattern
-          vec2 texCoordCenter = texCoordG; // Use green channel as center
-          vec3 blurredColor = vec3(0.0);
-          float totalWeight = 0.0;
-          
-          // Sample in a 3x3 grid for subtle blur
-          for (int x = -1; x <= 1; x++) {
-            for (int y = -1; y <= 1; y++) {
-              vec2 offset = vec2(float(x), float(y)) * blurStrength;
-              vec2 sampleCoord = clamp(texCoordCenter + offset, 0.0, 1.0);
+          // Only apply expensive motion blur when rotation velocity is high enough
+          if (motionBlurStrength > 0.1) {
+            // Calculate blur direction: tangential to rotation in texture space
+            vec2 texCenter = vec2(0.5, 0.5);
+            vec2 toTexCenter = texCoordG - texCenter;
+            vec2 tangentDir = normalize(vec2(-toTexCenter.y, toTexCenter.x)) * sign(rotationVelocity);
+            
+            // Scale blur based on distance from center (stronger at edges)
+            float distFromTexCenter = length(toTexCenter);
+            float blurScale = smoothstep(0.0, 0.5, distFromTexCenter); // Stronger blur at edges
+            motionBlurStrength *= blurScale;
+            
+            if (motionBlurStrength > 0.05) {
+              // Apply motion blur - optimized with 3 samples
+              vec3 blurR = vec3(0.0);
+              vec3 blurG = vec3(0.0);
+              vec3 blurB = vec3(0.0);
+              float totalWeight = 0.0;
               
-              // Gaussian weight
-              float dist = length(vec2(float(x), float(y)));
-              float weight = exp(-(dist * dist) / 0.5);
+              for (int i = -1; i <= 1; i++) {
+                float offset = float(i) * motionBlurStrength * 0.02;
+                float weight = i == 0 ? 1.0 : 0.5;
+                
+                vec2 sampleR = clamp(texCoordR + tangentDir * offset, 0.0, 1.0);
+                vec2 sampleG = clamp(texCoordG + tangentDir * offset, 0.0, 1.0);
+                vec2 sampleB = clamp(texCoordB + tangentDir * offset, 0.0, 1.0);
+                
+                blurR += texture2D(data, sampleR).rgb * weight;
+                blurG += texture2D(data, sampleG).rgb * weight;
+                blurB += texture2D(data, sampleB).rgb * weight;
+                totalWeight += weight;
+              }
               
-              vec4 sample = texture2D(data, sampleCoord);
-              blurredColor += sample.rgb * weight;
-              totalWeight += weight;
+              if (totalWeight > 0.0) {
+                color1R = blurR / totalWeight;
+                color1G = blurG / totalWeight;
+                color1B = blurB / totalWeight;
+              } else {
+                color1R = texture2D(data, texCoordR).rgb;
+                color1G = texture2D(data, texCoordG).rgb;
+                color1B = texture2D(data, texCoordB).rgb;
+              }
+              a1 = texture2D(data, texCoordG).a;
+            } else {
+              // No motion blur - direct sampling
+              color1R = texture2D(data, texCoordR).rgb;
+              color1G = texture2D(data, texCoordG).rgb;
+              color1B = texture2D(data, texCoordB).rgb;
+              a1 = texture2D(data, texCoordG).a;
             }
-          }
-          
-          if (totalWeight > 0.0) {
-            blurredColor /= totalWeight;
           } else {
-            blurredColor = vec3(r, g, b);
+            // No motion blur - direct sampling (fast path)
+            color1R = texture2D(data, texCoordR).rgb;
+            color1G = texture2D(data, texCoordG).rgb;
+            color1B = texture2D(data, texCoordB).rgb;
+            a1 = texture2D(data, texCoordG).a;
           }
           
-          // Blend between sharp and blurred - subtle blend
-          vec3 finalColor = mix(vec3(r, g, b), blurredColor, blurFactor * 0.6);
+          vec3 color1 = vec3(color1R.r, color1G.g, color1B.b);
+          
+          // Sample texture2 during transition - recalculate distortion for texture2's dimensions
+          vec3 color2 = vec3(0.0);
+          float a2 = 0.0;
+          if (transitionProgress > 0.0) {
+            // Recalculate image coordinates and distortion for texture2 using its dimensions
+            float dataMinDimension2 = min(dataDimensions2.x, dataDimensions2.y) / scopeDiameterRatio;
+            float dataWindowSize2 = dataMinDimension2 * dataScopePercentage;
+            vec2 i2 = vec2(0.0,0.0);
+            i2.x = (-dataWindowSize2 / 2.0 + k.x * dataWindowSize2) * (dataIsFacingUser == 1 ? -1.0 : 1.0);
+            i2.y = - (-dataWindowSize2 / 2.0 + k.y * dataWindowSize2);
+            i2 = rotate2d(i2, scopeRotation * (dataIsFacingUser == 1 ? -1.0 : 1.0));
+            i2 /= dataZoom;
+            
+            // Apply same distortion calculations but with texture2's window size
+            vec2 circleDistortionOffset2 = circleDistortionDir * circleDistortionStrength * dataWindowSize2 * 0.03;
+            vec2 iR2 = i2 + circleDistortionOffset2 + aberrationDir * aberrationStrength * dataWindowSize2;
+            vec2 iG2 = i2 + circleDistortionOffset2;
+            vec2 iB2 = i2 + circleDistortionOffset2 - aberrationDir * aberrationStrength * dataWindowSize2;
+            
+            iR2.x += dataDimensions2.x / 2.0;
+            iR2.y += dataDimensions2.y / 2.0;
+            iG2.x += dataDimensions2.x / 2.0;
+            iG2.y += dataDimensions2.y / 2.0;
+            iB2.x += dataDimensions2.x / 2.0;
+            iB2.y += dataDimensions2.y / 2.0;
+            
+            vec2 texCoordR2 = clamp(vec2(iR2.x, iR2.y) / vec2(dataDimensions2.x, dataDimensions2.y), 0.0, 1.0);
+            vec2 texCoordG2 = clamp(vec2(iG2.x, iG2.y) / vec2(dataDimensions2.x, dataDimensions2.y), 0.0, 1.0);
+            vec2 texCoordB2 = clamp(vec2(iB2.x, iB2.y) / vec2(dataDimensions2.x, dataDimensions2.y), 0.0, 1.0);
+            
+            // Simple direct sampling - image is already pre-rendered with all effects
+            vec3 color2R = texture2D(data2, texCoordR2).rgb;
+            vec3 color2G = texture2D(data2, texCoordG2).rgb;
+            vec3 color2B = texture2D(data2, texCoordB2).rgb;
+            color2 = vec3(color2R.r, color2G.g, color2B.b);
+            a2 = texture2D(data2, texCoordG2).a;
+          }
+          
+          // Blend between two images during transition
+          vec3 finalColor1 = color1;
+          vec3 finalColor2 = color2;
+          
+          // Edge blur - simplified for performance (only apply at very edges)
+          float blurFactor = pow(circleDistortionFactor, 3.0); // More aggressive falloff
+          
+          // Only apply edge blur at very edges to save performance
+          if (blurFactor > 0.8) {
+            float blurStrength = (blurFactor - 0.8) * 0.04; // Only blur in last 20% of edge
+            vec2 texCoordCenter = texCoordG;
+            
+            // Simplified blur - only 4 samples instead of 9 (unrolled for GLSL ES 1.0)
+            vec3 blur1 = color1;
+            
+            vec2 sample1 = clamp(texCoordCenter + vec2(blurStrength, 0.0), 0.0, 1.0);
+            vec2 sample2 = clamp(texCoordCenter + vec2(-blurStrength, 0.0), 0.0, 1.0);
+            vec2 sample3 = clamp(texCoordCenter + vec2(0.0, blurStrength), 0.0, 1.0);
+            vec2 sample4 = clamp(texCoordCenter + vec2(0.0, -blurStrength), 0.0, 1.0);
+            
+            blur1 += texture2D(data, sample1).rgb;
+            blur1 += texture2D(data, sample2).rgb;
+            blur1 += texture2D(data, sample3).rgb;
+            blur1 += texture2D(data, sample4).rgb;
+            
+            blur1 /= 5.0; // Average with original
+            
+            float blendAmount = (blurFactor - 0.8) * 5.0; // Scale to 0-1
+            finalColor1 = mix(color1, blur1, blendAmount);
+          }
+          
+          // Blend between images with smooth transition - simple opacity blend
+          float blendFactor = smoothstep(0.0, 1.0, transitionProgress); // Smooth easing
+          vec3 finalColor = mix(finalColor1, color2, blendFactor);
+          float finalAlpha = mix(a1, a2, blendFactor);
           
           // Limit reflections to main and adjacent tiles only (no infinite reflections)
           // tileDistance < 0.5 = main reflection, 0.5 <= tileDistance < 1.5 = adjacent reflections
@@ -418,7 +585,7 @@ async function main() {
           
           // Apply vignette (which now fades before mask edge) and mask
           float combinedMask = circleMask * tileMask;
-          gl_FragColor = vec4(finalColor * circleVignette, a * combinedMask);
+          gl_FragColor = vec4(finalColor * circleVignette, finalAlpha * combinedMask);
 
           // For debugging the kaleidoscope value
           // gl_FragColor=vec4(k.x, k.y, 0.0, 1.0);
@@ -438,22 +605,34 @@ async function main() {
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-  // Texture to contain the video data
-  const texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // Textures to contain the video/image data
+  texture1 = gl.createTexture();
+  texture2 = gl.createTexture();
+  
+  const setupTexture = (tex: WebGLTexture | null) => {
+    if (!tex) return;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  };
+  
+  setupTexture(texture1);
+  setupTexture(texture2);
 
-  // Bind texture to the "data" argument to the fragment shader
+  // Bind textures to the fragment shader
   gl.uniform1i(gl.getUniformLocation(program,'data'),0);
+  gl.uniform1i(gl.getUniformLocation(program,'data2'),1);
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D,texture);
+  gl.bindTexture(gl.TEXTURE_2D, texture1);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texture2);
 
   // Bind camera dimensions to the fragment shader
   const dataDimensionsBind = gl.getUniformLocation(program, 'dataDimensions');
+  const dataDimensions2Bind = gl.getUniformLocation(program, 'dataDimensions2');
   const dataIsFacingUserBind = gl.getUniformLocation(program, 'dataIsFacingUser');
   const dataZoomBind = gl.getUniformLocation(program, 'dataZoom');
   const canvasDimensionsBind = gl.getUniformLocation(program, 'canvasDimensions');
@@ -461,6 +640,8 @@ async function main() {
   const scopeRotationBind = gl.getUniformLocation(program, 'scopeRotation');
   const scopeSizeBind = gl.getUniformLocation(program, 'scopeSize');
   const scopeOffsetBind = gl.getUniformLocation(program, 'scopeOffset');
+  const rotationVelocityBind = gl.getUniformLocation(program, 'rotationVelocity');
+  const transitionProgressBind = gl.getUniformLocation(program, 'transitionProgress');
 
   function fastNormalSlow(fast: number, normal: number, slow: number) {
     if (keyPressedShift.value) {
@@ -478,9 +659,9 @@ async function main() {
     if (keyPressedA.value && keyPressedD.value) {
       // Do nothing
     } else if (keyPressedA.value) {
-      scopeRotationVel.value -= fastNormalSlow(0.001, 0.0002, 0.00005);
+      scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value - fastNormalSlow(0.001, 0.0002, 0.00005));
     } else if (keyPressedD.value) {
-      scopeRotationVel.value += fastNormalSlow(0.001, 0.0002, 0.00005);
+      scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value + fastNormalSlow(0.001, 0.0002, 0.00005));
     }
     if (keyPressedW.value && keyPressedS.value) {
       // Do nothing
@@ -520,48 +701,153 @@ async function main() {
     scopeOffset.value[1] += Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] + Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
 
     if (props.scopeAutoRotationVelocity !== 0) {
-      scopeRotationVel.value = props.scopeAutoRotationVelocity / 25;
+      scopeRotationVel.value = clampRotationVelocity(props.scopeAutoRotationVelocity / 25);
       scopeRotation.value += scopeRotationVel.value;
     }
     if (touchOrigin1 === null && mousePrevPosition === null) {
       scopeRotation.value += scopeRotationVel.value;
-      scopeRotationVel.value *= 0.99;
+      scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value * 0.99);
       scopeSizeVel.value *= 0.95;
       scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1 + Math.min(scopeSizeVel.value, 0.99))));
     }
     scopeOffsetVel.value[0] *= 0.95;
     scopeOffsetVel.value[1] *= 0.95;
 
+    // Track cumulative rotation for image switching
+    // Only accumulate rotation when not transitioning to prevent multiple rapid switches
+    if (!isTransitioning.value) {
+      const rotationDelta = scopeRotation.value - previousRotation.value;
+      // Normalize rotation delta to handle wraparound
+      let normalizedDelta = rotationDelta;
+      if (normalizedDelta > Math.PI) normalizedDelta -= Math.PI * 2;
+      if (normalizedDelta < -Math.PI) normalizedDelta += Math.PI * 2;
+      
+      // Track rotation direction based on the sign of the delta
+      if (Math.abs(normalizedDelta) > 0.001) { // Only update if there's meaningful rotation
+        rotationDirection.value = normalizedDelta > 0 ? 1 : -1; // 1 = clockwise, -1 = counter-clockwise
+      }
+      
+      cumulativeRotation.value += Math.abs(normalizedDelta);
+      previousRotation.value = scopeRotation.value;
+    } else {
+      // Still update previousRotation during transitions to prevent large jumps when transition completes
+      previousRotation.value = scopeRotation.value;
+    }
+
+    // Check if we should switch images (only if we have multiple uploaded images)
+    if (uploadedImageElements.value.length > 1 && !isTransitioning.value) {
+      const now = Date.now();
+      const timeSinceLastSwitch = now - lastSwitchTime.value;
+      const minSwitchInterval = 100; // Minimum 100ms between switches to prevent rapid cycling
+      
+      if (cumulativeRotation.value >= rotationThreshold && timeSinceLastSwitch >= minSwitchInterval) {
+        // Start transition to next/previous image based on rotation direction
+        // Clockwise rotation should move dot left (decrement index)
+        // Counter-clockwise rotation should move dot right (increment index)
+        const totalImages = uploadedImageElements.value.length;
+        if (rotationDirection.value > 0) {
+          // Clockwise rotation - move dot left (decrement)
+          nextImageIndex.value = (currentImageIndex.value - 1 + totalImages) % totalImages;
+        } else {
+          // Counter-clockwise rotation - move dot right (increment)
+          nextImageIndex.value = (currentImageIndex.value + 1) % totalImages;
+        }
+        isTransitioning.value = true;
+        transitionProgress.value = 0.0;
+        transitionStartTime.value = now;
+        cumulativeRotation.value = 0.0;
+        lastSwitchTime.value = now;
+        
+        // Upload next image to texture2 for transition
+        if (uploadedImageElements.value[nextImageIndex.value] && texture2) {
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, texture2);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImageElements.value[nextImageIndex.value]);
+        }
+      }
+    }
+
+    // Handle transition progress - time-based for smooth animation
+    if (isTransitioning.value) {
+      const now = Date.now();
+      const elapsed = now - transitionStartTime.value;
+      transitionProgress.value = Math.min(elapsed / transitionDuration, 1.0);
+      
+      if (transitionProgress.value >= 1.0) {
+        // Transition complete - switch to next image
+        currentImageIndex.value = nextImageIndex.value;
+        transitionProgress.value = 0.0;
+        isTransitioning.value = false;
+        cumulativeRotation.value = 0.0; // Reset cumulative rotation after transition completes
+        textureNeedsUpdate.value = true;
+        
+        // Update texture1 with the new current image
+        if (texture1 && uploadedImageElements.value[currentImageIndex.value]) {
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, texture1);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImageElements.value[currentImageIndex.value]);
+          textureNeedsUpdate.value = false;
+        }
+      }
+    }
+
     // Use uploaded image if available, otherwise use camera
-    const imageSource = uploadedImageElement.value || camera;
+    const hasUploadedImages = uploadedImageElements.value.length > 0;
+    const currentImage = hasUploadedImages ? uploadedImageElements.value[currentImageIndex.value] : null;
+    const imageSource = currentImage || camera;
     let imageWidth: number;
     let imageHeight: number;
     
-    if (uploadedImageElement.value) {
-      imageWidth = uploadedImageElement.value.width;
-      imageHeight = uploadedImageElement.value.height;
+    if (currentImage) {
+      imageWidth = currentImage.width;
+      imageHeight = currentImage.height;
     } else {
       imageWidth = camera.videoWidth || 1;
       imageHeight = camera.videoHeight || 1;
     }
 
+    // Get next image dimensions for texture2 during transition
+    let image2Width = imageWidth;
+    let image2Height = imageHeight;
+    if (isTransitioning.value && uploadedImageElements.value[nextImageIndex.value]) {
+      const nextImage = uploadedImageElements.value[nextImageIndex.value];
+      image2Width = nextImage.width;
+      image2Height = nextImage.height;
+    }
+
     // Only render if we have valid dimensions
     if (imageWidth > 0 && imageHeight > 0) {
-      // Only update texture if:
-      // 1. Using video (which changes every frame), OR
-      // 2. Texture needs update (new image uploaded or switched back to camera)
-      const isVideo = !uploadedImageElement.value;
-      if (isVideo || textureNeedsUpdate.value) {
+      // Update texture1 (current image)
+      // Only update texture when necessary to avoid blocking
+      const isVideo = !hasUploadedImages;
+      if (isVideo) {
+        // For video, update every frame (but this is necessary for live video)
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, texture1);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageSource);
-        textureNeedsUpdate.value = false; // Reset flag after update
+      } else if (textureNeedsUpdate.value && currentImage) {
+        // For uploaded images, only update when the image changes
+        // Double-check that the image exists and is valid
+        if (currentImage.width > 0 && currentImage.height > 0) {
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, texture1);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, currentImage);
+          textureNeedsUpdate.value = false;
+        }
       }
+      
       gl.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
-    gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
-    gl.uniform1f(dataZoomBind, cameraZoom.value);
-    gl.uniform1i(scopeShapeBind, props.scopeShape);
-    gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
-    gl.uniform1f(scopeSizeBind, scopeSize.value);
-    gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
+      gl.uniform2f(dataDimensions2Bind, image2Width, image2Height);
+      gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
+      gl.uniform1f(dataZoomBind, cameraZoom.value);
+      gl.uniform1i(scopeShapeBind, props.scopeShape);
+      gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
+      gl.uniform1f(scopeSizeBind, scopeSize.value);
+      gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
+      gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
+      if (transitionProgressBind) {
+        gl.uniform1f(transitionProgressBind, transitionProgress.value);
+      }
       gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
@@ -627,16 +913,16 @@ function touchMoveCallback(event: TouchEvent) {
   const deltaX = (touch.clientX - touchPrev1.clientX) / deltaTime;
   const deltaY = (touch.clientY - touchPrev1.clientY) / deltaTime;
 
-  scopeRotation.value += deltaX / 10;
+  scopeRotation.value += deltaX / 22;
   if (Math.abs(touch.clientX - touchPrev1.clientX) > 1) {
-    scopeRotationVel.value = deltaX / 10;
+    scopeRotationVel.value = clampRotationVelocity(deltaX / 22);
   } else {
     scopeRotationVel.value = 0;
   }
 
-  scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 10)));
+  scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 7)));
   if (Math.abs(touch.clientY - touchPrev1.clientY) > 1) {
-    scopeSizeVel.value = deltaY / 10;
+    scopeSizeVel.value = deltaY / 7;
   } else {
     scopeSizeVel.value = 0;
   }
@@ -691,16 +977,16 @@ onMounted(() => {
     const deltaX = (mouseEvent.clientX - mousePrevPosition.x) / 10;
     const deltaY = (mouseEvent.clientY - mousePrevPosition.y) / 10;
 
-    scopeRotation.value += deltaX / 20;
+    scopeRotation.value += deltaX / 35;
     if (Math.abs(mouseEvent.clientX - mousePrevPosition.x) > 1) {
-      scopeRotationVel.value = deltaX / 20;
+      scopeRotationVel.value = clampRotationVelocity(deltaX / 35);
     } else {
       scopeRotationVel.value = 0;
     }
 
-    scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 50)));
+    scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 35)));
     if (Math.abs(mouseEvent.clientY - mousePrevPosition.y) > 1) {
-      scopeSizeVel.value = deltaY / 50;
+      scopeSizeVel.value = deltaY / 35;
     } else {
       scopeSizeVel.value = 0;
     }
@@ -786,19 +1072,23 @@ onMounted(() => {
   });
 });
 
-// Watch for changes to uploaded image
-watch(() => props.uploadedImage, async (newImage) => {
-  if (newImage) {
-    await loadUploadedImage(newImage);
+// Watch for changes to uploaded images
+watch(() => props.uploadedImages, async (newImages) => {
+  if (newImages && newImages.length > 0) {
+    await loadUploadedImages(newImages);
   } else {
-    uploadedImageElement.value = null;
-    // Restart camera if no image is uploaded
+    uploadedImageElements.value = [];
+    currentImageIndex.value = 0;
+    cumulativeRotation.value = 0.0;
+    transitionProgress.value = 0.0;
+    isTransitioning.value = false;
+    // Restart camera if no images are uploaded
     const camera = document.getElementById('camera') as HTMLVideoElement | null;
     if (camera && !cameraStream) {
       try {
         cameraStream = await navigator.mediaDevices.getUserMedia({video: { facingMode: { exact: 'environment'} }, audio: false});
         facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-      } catch (e) {
+      } catch {
         try {
           cameraStream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
           facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
@@ -812,7 +1102,7 @@ watch(() => props.uploadedImage, async (newImage) => {
       }
     }
   }
-});
+}, { immediate: false });
 
 </script>
 
@@ -830,6 +1120,24 @@ watch(() => props.uploadedImage, async (newImage) => {
     playsinline
     crossorigin="anonymous"
   />
+  <div
+    v-if="uploadedImageElements.length > 1"
+    class="absolute left-1/2 transform -translate-x-1/2 flex gap-2 items-center pointer-events-none z-10"
+    style="top: calc(50% - min(25vw, 25vh) - 3rem);"
+  >
+    <div
+      v-for="(_, index) in uploadedImageElements"
+      :key="index"
+      class="rounded-full transition-all duration-300"
+      :class="{
+        'w-3 h-3 bg-white/80 dark:bg-white/60 shadow-lg': index === (isTransitioning ? nextImageIndex : currentImageIndex),
+        'w-2 h-2 bg-white/40 dark:bg-white/30': index !== (isTransitioning ? nextImageIndex : currentImageIndex)
+      }"
+      :style="{
+        opacity: index === (isTransitioning ? nextImageIndex : currentImageIndex) ? 1 : 0.5
+      }"
+    />
+  </div>
 </template>
 
 <style scoped>
