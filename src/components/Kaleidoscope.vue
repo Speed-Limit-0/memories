@@ -389,8 +389,11 @@ async function main() {
           vec2 screenPosForMask = vec2(fragCoord.x, 1.0 - fragCoord.y); // Account for flipped y-coordinate
           float distFromCenter = distance(screenPosForMask, screenCenter);
           float circleRadius = 0.25; // Radius of the circle (smaller than half the screen)
-          // Hard edge cutoff - no smoothstep to eliminate halo completely
-          float circleMask = step(distFromCenter, circleRadius); // Hard edge, no transparency gradient
+          // Hard edge cutoff - discard fragments outside circle for proper clipping on mobile
+          if (distFromCenter > circleRadius) {
+            discard; // Completely discard fragments outside the circle
+          }
+          float circleMask = 1.0; // All remaining fragments are inside the circle
           
           // Radial vignette for circular container - progressively darken towards edges
           float normalizedDistFromCenter = distFromCenter / circleRadius; // Normalize to [0, 1] within circle
