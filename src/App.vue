@@ -35,6 +35,8 @@ const showCapture = ref(false);
 const showControls = ref(true);
 const selectedIndex = ref(ScopeShape.Equilateral);
 const scopeAutoRotationVelocity = ref(0);
+const uploadedImage = ref(null as null|string);
+const fileInputRef = useTemplateRef('file-input');
 function updateSelectedIndex (value: number) {
   selectedIndex.value = value;
 }
@@ -53,6 +55,25 @@ function savedFrame(objectUrl: string) {
   showCapture.value = true;
   capturedFrame.value = objectUrl;
 }
+
+const handleFileUpload = (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  const file = target.files?.[0];
+  if (file && file.type.startsWith('image/')) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result;
+      if (typeof result === 'string') {
+        uploadedImage.value = result;
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+};
+
+const handleUploadClick = () => {
+  fileInputRef.value?.click();
+};
 
 window.addEventListener('keypress', (keyEvent) => {
   if (keyEvent.code == 'Digit1') {
@@ -91,6 +112,7 @@ onUpdated(() => {
     :scope-shape="selectedIndex"
     :scope-auto-rotation-velocity="scopeAutoRotationVelocity"
     :save-next-frame="saveNextFrame"
+    :uploaded-image="uploadedImage"
     @save-frame="savedFrame"
   />
   <div
@@ -144,12 +166,25 @@ onUpdated(() => {
           @press="saveNextFrame = true"
         />
         <IconButton
+          image-url="/upload.svg"
+          label="Upload image"
+          class="w-full"
+          @press="handleUploadClick"
+        />
+        <IconButton
           image-url="/info.svg"
           class="w-full"
           label="Info"
           @press="showInfo = true"
         />
       </div>
+      <input
+        ref="file-input"
+        type="file"
+        accept="image/*"
+        class="hidden"
+        @change="handleFileUpload"
+      >
     </div>
   </div>
   <div

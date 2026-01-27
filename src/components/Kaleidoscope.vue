@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import {ref, onMounted, useTemplateRef} from 'vue';
+import {ref, onMounted, useTemplateRef, watch} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
   scopeShape: ScopeShape,
   scopeAutoRotationVelocity: number
   saveNextFrame: boolean
+  uploadedImage?: string | null
 }>();
 
 const emit = defineEmits(['save-frame']);
@@ -32,36 +33,67 @@ const keyPressedL = ref(false);
 const keyPressedMinus = ref(false);
 const keyPressedPlus = ref(false);
 const canvas = useTemplateRef('canvas');
+const uploadedImageElement = ref(null as HTMLImageElement | null);
+let cameraStream: MediaStream | null = null;
+let textureNeedsUpdate = ref(true);
+
+const loadUploadedImage = async (imageSrc: string | null) => {
+  if (imageSrc) {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = imageSrc;
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+    });
+    uploadedImageElement.value = img;
+    facingMode.value = 'user'; // Default for uploaded images
+    textureNeedsUpdate.value = true; // Mark texture for update
+    
+    // Stop camera stream if image is uploaded
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      cameraStream = null;
+    }
+  } else {
+    uploadedImageElement.value = null;
+    textureNeedsUpdate.value = true; // Mark texture for update when switching back to camera
+  }
+};
 
 async function main() {
   // Capture webcam input using invisible `video` element
   // Adapted from p5js.org/examples/3d-shader-using-webcam.html
   const camera = document.getElementById('camera') as HTMLVideoElement;
 
-  // Ask user permission to record their camera
-  let stream: MediaStream | null = null;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({video: { facingMode: { exact: 'environment'} }, audio: false});
-    facingMode.value = stream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-  } catch (e) {
-    console.info('Failed to get environment camera. Trying any camera, under the assumption it is a user-facing camera', e);
+  // If an image is uploaded, create an image element for it
+  if (props.uploadedImage) {
+    await loadUploadedImage(props.uploadedImage);
+  } else {
+    // Ask user permission to record their camera
     try {
-      stream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
-      facingMode.value = stream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-    } catch (e2) {
-      if ((e2 as Error).name === 'ConstraintNotSatisfiedError') {
-        console.error('Device has no camera', e2);
-      } else if ((e2 as Error).name === 'PermissionDeniedError') {
-        console.error('Permissions not accepted', e2);
-      } else {
-        console.error('Other error', e2);
+      cameraStream = await navigator.mediaDevices.getUserMedia({video: { facingMode: { exact: 'environment'} }, audio: false});
+      facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
+    } catch (e) {
+      console.info('Failed to get environment camera. Trying any camera, under the assumption it is a user-facing camera', e);
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
+        facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
+      } catch (e2) {
+        if ((e2 as Error).name === 'ConstraintNotSatisfiedError') {
+          console.error('Device has no camera', e2);
+        } else if ((e2 as Error).name === 'PermissionDeniedError') {
+          console.error('Permissions not accepted', e2);
+        } else {
+          console.error('Other error', e2);
+        }
       }
     }
-  }
 
-  if (stream !== null) {
-    camera.srcObject = stream;
-    camera.play();
+    if (cameraStream !== null) {
+      camera.srcObject = cameraStream;
+      camera.play();
+    }
   }
 
   // Canvas with WebGL context
@@ -310,6 +342,14 @@ async function main() {
           vec2 u = vec2(fragCoord.x,1.0-fragCoord.y);
           vec2 k = u;
 
+          // Calculate tile distance from center BEFORE kaleidoscope transformation
+          // This tells us which reflection copy we're in
+          vec2 uCentered = u - vec2(0.5, 0.5);
+          uCentered = rotate2d(uCentered, -scopeRotation);
+          uCentered /= scopeSize; // Scale to tile space
+          // Use circular/Euclidean distance to avoid star-shaped artifacts
+          float tileDistance = length(uCentered);
+
           vec2 scopeOrigin = vec2(0.0, 0.0);
           float scopeDiameterRatio = sqrt(2.0);
           vec2 d = rotate2d(scopeOffset, 0.0);
@@ -326,6 +366,50 @@ async function main() {
             k = scalene(k, scopeSize, scopeRotation, d);
           }
 
+          // Calculate distance from edges of THIS reflection segment (using k coordinate)
+          // k represents position within a single reflection segment, typically in [0,1] range
+          // Calculate distance to nearest edge (more reliable than center distance)
+          float distToEdgeX = min(k.x, 1.0 - k.x);
+          float distToEdgeY = min(k.y, 1.0 - k.y);
+          float distToNearestEdge = min(distToEdgeX, distToEdgeY);
+          // Also calculate distance from center for radial effects
+          vec2 segmentCenter = vec2(0.5, 0.5);
+          vec2 toSegmentCenter = k - segmentCenter;
+          float distFromSegmentCenter = length(toSegmentCenter);
+          float maxSegmentDist = 0.707; // Maximum distance to corner
+          
+          // Progressive edge factor: smoothly transitions from 0 (center) to 1 (edges)
+          // Use distance to nearest edge for smooth progressive effect
+          float edgeFactorFromEdge = 1.0 - smoothstep(0.0, 0.5, distToNearestEdge); // Progressive from center to edge
+          // Also use radial distance for smooth radial progression
+          float edgeFactorFromCenter = smoothstep(0.0, maxSegmentDist, distFromSegmentCenter); // Progressive from center outward
+          // Combine both for comprehensive edge detection - blend smoothly
+          float edgeFactor = mix(edgeFactorFromCenter, edgeFactorFromEdge, 0.6);
+          // Ensure smooth progressive transition (no sharp cutoffs)
+          edgeFactor = smoothstep(0.0, 1.0, edgeFactor);
+          
+          // Refraction/distortion at edges of each reflection - warp outward from segment center
+          // Distortion should ONLY apply at edges, not at center
+          // Create a distortion factor that's zero at center and increases toward edges
+          float distortionFactor = 1.0 - smoothstep(0.0, 0.4, distToNearestEdge); // Zero at center, 1 at edges
+          distortionFactor = pow(distortionFactor, 0.8); // Make it more edge-focused
+          
+          // Use a smoother distortion direction to avoid visible lines along diagonals
+          // Rotate the direction slightly to break up diagonal patterns
+          vec2 distortionDir = normalize(toSegmentCenter + vec2(0.001)); // Avoid division by zero
+          distortionDir = rotate2d(distortionDir, 0.1); // Slight rotation to smooth out diagonal lines
+          
+          // Reduce distortion for square-based shapes (Square and Isosceles) to avoid aggressive artifacts
+          float distortionMultiplier = 2.5;
+          if (scopeShape == ${ScopeShape.Square} || scopeShape == ${ScopeShape.Isosceles}) {
+            distortionMultiplier = 1.2; // Much less aggressive for square-based patterns
+          }
+          float distortionStrength = distortionFactor * distortionMultiplier;
+          // Scale by distance from center to make it stronger further from center
+          float distortionScale = smoothstep(0.3, maxSegmentDist, distFromSegmentCenter); // Start later to avoid center artifacts
+          // Apply smoother, more gradual distortion
+          vec2 distortedK = k + distortionDir * distortionStrength * distortionScale * smoothstep(0.0, 1.0, distFromSegmentCenter / maxSegmentDist);
+          
           // Now map the k value to coordinates on the image
           // 0,0 will be the centre of the image
           // 1,1 will be the top right of the image (not the bottom left– It's easier to orientate if things are up-right)
@@ -333,15 +417,81 @@ async function main() {
           float dataWindowSize = dataMinDimension * dataScopePercentage;
           vec2 i = vec2(0.0,0.0);
           // x-axis is flipped only when the camera is pointed to the user
-          i.x = (-dataWindowSize / 2.0 + k.x * dataWindowSize) * (dataIsFacingUser == 1 ? -1.0 : 1.0);
+          i.x = (-dataWindowSize / 2.0 + distortedK.x * dataWindowSize) * (dataIsFacingUser == 1 ? -1.0 : 1.0);
           // y-axis is flipped because of openGL coordinate space
-          i.y = - (-dataWindowSize / 2.0 + k.y * dataWindowSize);
+          i.y = - (-dataWindowSize / 2.0 + distortedK.y * dataWindowSize);
           i = rotate2d(i, scopeRotation * (dataIsFacingUser == 1 ? -1.0 : 1.0));
           i /= dataZoom;
-          i.x += dataDimensions.x / 2.0;
-          i.y += dataDimensions.y / 2.0;
-
-          gl_FragColor=texture2D(data,vec2(i.x, i.y)/vec2(dataDimensions.x,dataDimensions.y)).xyzw;
+          
+          // Chromatic aberration - sample RGB channels at slightly offset positions
+          // Offset direction is radial from segment center
+          float aberrationStrength = edgeFactor * 0.02; // Reduced aberration strength (in texture coordinate space)
+          vec2 aberrationDir = normalize(rotate2d(toSegmentCenter, scopeRotation) + vec2(0.001)); // Avoid division by zero
+          
+          vec2 iR = i + aberrationDir * aberrationStrength * dataWindowSize;
+          vec2 iG = i;
+          vec2 iB = i - aberrationDir * aberrationStrength * dataWindowSize;
+          
+          iR.x += dataDimensions.x / 2.0;
+          iR.y += dataDimensions.y / 2.0;
+          iG.x += dataDimensions.x / 2.0;
+          iG.y += dataDimensions.y / 2.0;
+          iB.x += dataDimensions.x / 2.0;
+          iB.y += dataDimensions.y / 2.0;
+          
+          vec2 texCoordR = clamp(vec2(iR.x, iR.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
+          vec2 texCoordG = clamp(vec2(iG.x, iG.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
+          vec2 texCoordB = clamp(vec2(iB.x, iB.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
+          
+          float r = texture2D(data, texCoordR).r;
+          float g = texture2D(data, texCoordG).g;
+          float b = texture2D(data, texCoordB).b;
+          float a = texture2D(data, texCoordG).a;
+          
+          // Vignetting - progressively darken edges of each reflection segment
+          // Radial vignette: darkens in a circular pattern from center outward
+          float vignetteFactor = smoothstep(0.0, maxSegmentDist, distFromSegmentCenter); // Radial distance from center
+          float vignette = 1.0 - vignetteFactor * 0.6; // Progressive darkening (60% darker at edges)
+          vignette = max(vignette, 0.05); // Keep minimum brightness
+          
+          // Progressive dimming based on tile distance from center
+          // This makes each reflection copy dimmer as it gets further from the center tile
+          // tileDistance represents how many tiles away from center we are
+          float dimmingFactor = smoothstep(0.0, 2.0, tileDistance); // Dim over first 2 tiles from center (starts earlier)
+          dimmingFactor = pow(dimmingFactor, 0.4); // Smoother, earlier falloff
+          
+          // Dim reflections based on tile distance - each copy gets darker
+          float dimming = 1.0 - dimmingFactor * 0.8; // Dim reflections (80% dimmer for distant tiles)
+          dimming = max(dimming, 0.2); // Keep minimum brightness (20% for very distant tiles)
+          
+          // Progressive blur based on tile distance (same as dimming)
+          // Blur strength increases as reflections get further from center
+          float blurFactor = smoothstep(0.0, 2.0, tileDistance); // Blur over first 2 tiles from center
+          blurFactor = pow(blurFactor, 0.4); // Same falloff as dimming
+          float blurStrength = blurFactor * 0.025; // Maximum blur strength (adjustable)
+          
+          // Sample texture at multiple offset positions for blur effect
+          vec2 texCoordCenter = vec2(iG.x, iG.y) / vec2(dataDimensions.x, dataDimensions.y);
+          vec2 blurOffset = vec2(blurStrength, 0.0);
+          
+          // Simple box blur - sample 9 points in a 3x3 grid
+          vec3 blurredColor = vec3(0.0);
+          float sampleCount = 0.0;
+          for (float x = -1.0; x <= 1.0; x += 1.0) {
+            for (float y = -1.0; y <= 1.0; y += 1.0) {
+              vec2 offset = vec2(x, y) * blurStrength;
+              vec2 sampleCoord = clamp(texCoordCenter + offset, 0.0, 1.0);
+              vec4 sample = texture2D(data, sampleCoord);
+              blurredColor += sample.rgb;
+              sampleCount += 1.0;
+            }
+          }
+          blurredColor /= sampleCount;
+          
+          // Blend between sharp and blurred based on blur strength
+          vec3 finalColor = mix(vec3(r, g, b), blurredColor, blurFactor);
+          
+          gl_FragColor = vec4(finalColor * vignette * dimming, a);
 
           // For debugging the kaleidoscope value
           // gl_FragColor=vec4(k.x, k.y, 0.0, 1.0);
@@ -471,16 +621,39 @@ async function main() {
     scopeOffsetVel.value[0] *= 0.95;
     scopeOffsetVel.value[1] *= 0.95;
 
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, camera);
-    gl.uniform2f(dataDimensionsBind, camera.videoWidth, camera.videoHeight);
+    // Use uploaded image if available, otherwise use camera
+    const imageSource = uploadedImageElement.value || camera;
+    let imageWidth: number;
+    let imageHeight: number;
+    
+    if (uploadedImageElement.value) {
+      imageWidth = uploadedImageElement.value.width;
+      imageHeight = uploadedImageElement.value.height;
+    } else {
+      imageWidth = camera.videoWidth || 1;
+      imageHeight = camera.videoHeight || 1;
+    }
+
+    // Only render if we have valid dimensions
+    if (imageWidth > 0 && imageHeight > 0) {
+      // Only update texture if:
+      // 1. Using video (which changes every frame), OR
+      // 2. Texture needs update (new image uploaded or switched back to camera)
+      const isVideo = !uploadedImageElement.value;
+      if (isVideo || textureNeedsUpdate.value) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageSource);
+        textureNeedsUpdate.value = false; // Reset flag after update
+      }
+      gl.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
     gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
     gl.uniform1f(dataZoomBind, cameraZoom.value);
     gl.uniform1i(scopeShapeBind, props.scopeShape);
     gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
     gl.uniform1f(scopeSizeBind, scopeSize.value);
     gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
-    gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
 
     if (props.saveNextFrame) {
       emit(
@@ -700,6 +873,34 @@ onMounted(() => {
       keyPressedAlt.value = false;
     }
   });
+});
+
+// Watch for changes to uploaded image
+watch(() => props.uploadedImage, async (newImage) => {
+  if (newImage) {
+    await loadUploadedImage(newImage);
+  } else {
+    uploadedImageElement.value = null;
+    // Restart camera if no image is uploaded
+    const camera = document.getElementById('camera') as HTMLVideoElement | null;
+    if (camera && !cameraStream) {
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({video: { facingMode: { exact: 'environment'} }, audio: false});
+        facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
+      } catch (e) {
+        try {
+          cameraStream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
+          facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
+        } catch (e2) {
+          console.error('Failed to restart camera', e2);
+        }
+      }
+      if (cameraStream && camera) {
+        camera.srcObject = cameraStream;
+        camera.play();
+      }
+    }
+  }
 });
 
 </script>
