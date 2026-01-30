@@ -79,7 +79,7 @@ onMounted(() => {
   >
     <img
       class="
-        h-full
+        h-5 w-5 shrink-0
         pointer-events-none
         transition-opacity ease-out duration-300
       "

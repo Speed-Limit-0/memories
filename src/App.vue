@@ -4,7 +4,6 @@ import SegmentedControl, { Option } from './components/SegmentedControl.vue';
 import {onUpdated, ref, useTemplateRef} from 'vue';
 import SteeringControl from './components/SteeringControl.vue';
 import { ScopeShape } from './scopeShape.ts';
-import Prompt from './components/Prompt.vue';
 import IconButton from './components/IconButton.vue';
 import CaptureModal from './components/CaptureModal.vue';
 
@@ -19,8 +18,6 @@ const options: Option[] = [
   },
 ];
 
-const showPrompt = ref(true);
-const showInfo = ref(false);
 const saveNextFrame = ref(false);
 const capturedFrame = ref(null as null|string);
 const showCapture = ref(false);
@@ -35,11 +32,6 @@ function updateSelectedIndex (value: number) {
 
 function updateScopeAutoRotationVelocity(value: number) {
   scopeAutoRotationVelocity.value = value;
-}
-
-function dismissPrompt() {
-  showPrompt.value = false;
-  showInfo.value = false;
 }
 
 function savedFrame(objectUrl: string) {
@@ -87,9 +79,6 @@ window.addEventListener('keypress', (keyEvent) => {
   if (keyEvent.code != 'KeyH') {
     return;
   }
-  if (showPrompt.value) {
-    return;
-  }
   showControls.value = !showControls.value;
 });
 
@@ -107,7 +96,6 @@ onUpdated(() => {
 
 <template>
   <Kaleidoscope
-    v-if="!showPrompt"
     :scope-shape="selectedIndex"
     :scope-auto-rotation-velocity="scopeAutoRotationVelocity"
     :save-next-frame="saveNextFrame"
@@ -115,7 +103,7 @@ onUpdated(() => {
     @save-frame="savedFrame"
   />
   <div
-    v-if="!showPrompt && !showInfo && !showCapture && showControls"
+    v-if="!showCapture && showControls"
     class="absolute w-full flex flex-col justify-end gap-1 px-2 py-1 items-center pointer-events-none"
     style="bottom:calc(env(safe-area-inset-bottom))"
   >
@@ -133,8 +121,6 @@ onUpdated(() => {
       relative
       bg-neutral-300/50
       dark:bg-neutral-800/70
-      shadow-lg
-      dark:shadow-none
       backdrop-blur-xl
       rounded-xl
       text-sm
@@ -170,12 +156,6 @@ onUpdated(() => {
           class="w-full"
           @press="handleUploadClick"
         />
-        <IconButton
-          image-url="/info.svg"
-          class="w-full"
-          label="Info"
-          @press="showInfo = true"
-        />
       </div>
       <input
         ref="file-input"
@@ -196,28 +176,6 @@ onUpdated(() => {
     <CaptureModal
       :url="capturedFrame"
       @done="showCapture = false"
-    />
-  </div>
-  <div
-    v-if="showInfo"
-    class="absolute left-0 top-0 h-screen w-screen grid grid-cols-1 grid-rows-1 p-2 overflow-auto bg-black/20 backdrop-blur-xl"
-    style="width:100dvw;height:100dvh;background-size: cover;"
-  >
-    <Prompt
-      :is-resume-prompt="true"
-      @click:enter="dismissPrompt"
-    />
-  </div>
-  <div
-    v-if="showPrompt"
-    class="absolute left-0 top-0 h-screen w-screen grid grid-cols-1 grid-rows-1 p-2 overflow-auto"
-    style="width:100dvw;height:100dvh;background-size: cover;"
-    :style="{
-      'background-image': `url('/kaleidoscope-${Math.ceil(Math.random() * 10)}.jpg')`
-    }"
-  >
-    <Prompt
-      @click:enter="dismissPrompt"
     />
   </div>
 </template>

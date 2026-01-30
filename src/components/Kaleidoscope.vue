@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, onMounted, useTemplateRef, watch} from 'vue';
+import {ref, onMounted, nextTick, useTemplateRef, watch} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
@@ -14,7 +14,7 @@ const emit = defineEmits(['save-frame']);
 const facingMode = ref('unknown');
 const cameraZoom = ref(1);
 const scopeRotation = ref(0.0);
-const scopeSize = ref(0.5);
+const scopeSize = ref(1);
 const scopeOffset = ref([0.0, 0.0]);
 const scopeOffsetVel = ref([0.0, 0.0]);
 const scopeSizeVel = ref(0.0);
@@ -40,6 +40,7 @@ const previousRotation = ref(0.0);
 const rotationThreshold = Math.PI / 4; // Switch after 45 degrees (much less rotation needed)
 const lastSwitchTime = ref(0); // Track when we last switched to prevent rapid switching
 const maxRotationSpeed = 0.01; // Maximum rotation velocity
+const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 const transitionProgress = ref(0.0);
 const isTransitioning = ref(false);
 const nextImageIndex = ref(0);
@@ -50,6 +51,9 @@ let cameraStream: MediaStream | null = null;
 
 const clampRotationVelocity = (velocity: number): number => {
   return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
+};
+const clampScopeSizeVelocity = (velocity: number): number => {
+  return Math.max(-maxScopeSizeVel, Math.min(maxScopeSizeVel, velocity));
 };
 const textureNeedsUpdate = ref(true);
 let texture1: WebGLTexture | null = null;
@@ -107,7 +111,7 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
     uploadedImageElements.value = loadedImages;
     currentImageIndex.value = 0;
     cumulativeRotation.value = 0.0;
-    facingMode.value = 'user'; // Default for uploaded images
+    facingMode.value = 'environment'; // Don't flip uploaded images (x-flip is only for user-facing webcam)
     textureNeedsUpdate.value = true; // Mark texture for update
     
     // Stop camera stream if images are uploaded
@@ -122,7 +126,7 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
   }
 };
 
-async function main() {
+async function main(canvasElement: HTMLCanvasElement) {
   // Capture webcam input using invisible `video` element
   // Adapted from p5js.org/examples/3d-shader-using-webcam.html
   const camera = document.getElementById('camera') as HTMLVideoElement;
@@ -157,12 +161,11 @@ async function main() {
     }
   }
 
-  // Canvas with WebGL context
-  const canvas = document.getElementById('maincanvas') as HTMLCanvasElement;
+  // Canvas with WebGL context (element passed from template ref so it exists when mounted)
   const canvasSize = Math.max(1024, window.innerWidth, window.innerHeight) * window.devicePixelRatio;
-  const gl = canvas.getContext('webgl')!;
-  canvas.width = canvas.height = canvasSize;
-  gl.viewport(0, 0, canvas.width, canvas.height);
+  const gl = canvasElement.getContext('webgl')!;
+  canvasElement.width = canvasElement.height = canvasSize;
+  gl.viewport(0, 0, canvasElement.width, canvasElement.height);
 
   // Vertex shader: Identity map
   const vshader = gl.createShader(gl.VERTEX_SHADER)!;
@@ -384,16 +387,11 @@ async function main() {
           i = rotate2d(i, scopeRotation * (dataIsFacingUser == 1 ? -1.0 : 1.0));
           i /= dataZoom;
           
-          // Circular mask - calculate distance from center of screen
+          // Circular container: clipping is done by wrapper div (overflow hidden + rounded-full)
           vec2 screenCenter = vec2(0.5, 0.5);
           vec2 screenPosForMask = vec2(fragCoord.x, 1.0 - fragCoord.y); // Account for flipped y-coordinate
           float distFromCenter = distance(screenPosForMask, screenCenter);
-          float circleRadius = 0.25; // Radius of the circle (smaller than half the screen)
-          // Hard edge cutoff - discard fragments outside circle for proper clipping on mobile
-          if (distFromCenter > circleRadius) {
-            discard; // Completely discard fragments outside the circle
-          }
-          float circleMask = 1.0; // All remaining fragments are inside the circle
+          float circleRadius = 0.5; // Full extent (radius 0.5 = diameter 1) since div clips to circle
           
           // Radial vignette for circular container - progressively darken towards edges
           float normalizedDistFromCenter = distFromCenter / circleRadius; // Normalize to [0, 1] within circle
@@ -421,7 +419,7 @@ async function main() {
           // Chromatic aberration - only apply at circular container edges
           // Offset direction is radial from circle center (not segment center)
           // Only apply aberration when inside the circular container
-          float aberrationStrength = circleDistortionFactor * circleMask * 0.02; // Reduced aberration strength (in texture coordinate space)
+          float aberrationStrength = circleDistortionFactor * 0.02; // Reduced aberration strength (in texture coordinate space)
           vec2 aberrationDir = normalize(rotate2d(screenPosForMask - screenCenter, scopeRotation) + vec2(0.001)); // Avoid division by zero
           
           vec2 iR = i + circleDistortionOffset + aberrationDir * aberrationStrength * dataWindowSize;
@@ -586,8 +584,8 @@ async function main() {
           float maxTileDistance = 1.5; // Maximum tile distance to show
           float tileMask = 1.0 - smoothstep(maxTileDistance - 0.1, maxTileDistance, tileDistance); // Smooth edge
           
-          // Apply vignette (which now fades before mask edge) and mask
-          float combinedMask = circleMask * tileMask;
+          // Apply vignette and tile mask (circle clipping is done by wrapper div)
+          float combinedMask = tileMask;
           gl_FragColor = vec4(finalColor * circleVignette, finalAlpha * combinedMask);
 
           // For debugging the kaleidoscope value
@@ -711,7 +709,7 @@ async function main() {
       scopeRotation.value += scopeRotationVel.value;
       scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value * 0.99);
       scopeSizeVel.value *= 0.95;
-      scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1 + Math.min(scopeSizeVel.value, 0.99))));
+      scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1 + Math.min(scopeSizeVel.value, 0.99))));
     }
     scopeOffsetVel.value[0] *= 0.95;
     scopeOffsetVel.value[1] *= 0.95;
@@ -858,7 +856,7 @@ async function main() {
     if (props.saveNextFrame) {
       emit(
         'save-frame',
-        canvas.toDataURL('image/jpeg', 0.8)
+        canvasElement.toDataURL('image/jpeg', 0.8)
       );
     }
 
@@ -876,6 +874,7 @@ let touchId1: null|number = null;
 let touchOrigin1: null|Point = null;
 let touchPrevTime = new Date().getTime();
 let touchPrev1: null|Point = null;
+let pinchPrevDist: null|number = null;
 
 function getTouchById(touches: TouchList, id: number): Touch | null {
   for (let i = 0; i < touches.length; i += 1) {
@@ -886,55 +885,89 @@ function getTouchById(touches: TouchList, id: number): Touch | null {
   return null;
 }
 
+function touchDistance(t1: Touch, t2: Touch): number {
+  return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+}
+
 function touchStartCallback(event: TouchEvent) {
   event.preventDefault();
-  if (touchId1 !== null) {
+  const len = event.touches.length;
+  if (len === 2) {
+    touchId1 = null;
+    touchPrev1 = null;
+    touchOrigin1 = null;
+    pinchPrevDist = touchDistance(event.touches[0], event.touches[1]);
+    scopeSizeVel.value = 0;
     return;
   }
-  const touch = event.changedTouches[0];
-  touchId1 = touch.identifier;
-  touchPrev1 = touch;
-  touchOrigin1 = touch;
-  touchPrevTime = new Date().getTime();
-  isUserPressing.value = true;
-  scopeRotationVel.value = 0;
-  scopeSizeVel.value = 0;
+  if (len === 1 && touchId1 === null && pinchPrevDist === null) {
+    const touch = event.changedTouches[0];
+    touchId1 = touch.identifier;
+    touchPrev1 = touch;
+    touchOrigin1 = touch;
+    touchPrevTime = new Date().getTime();
+    isUserPressing.value = true;
+    scopeRotationVel.value = 0;
+    scopeSizeVel.value = 0;
+  }
 }
 
 function touchMoveCallback(event: TouchEvent) {
-  if (touchId1 === null || touchPrev1 === null || touchOrigin1 === null) {
+  const len = event.touches.length;
+  if (len === 2 && pinchPrevDist !== null) {
+    const dist = touchDistance(event.touches[0], event.touches[1]);
+    const ratio = dist / pinchPrevDist;
+    scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * ratio));
+    scopeSizeVel.value = clampScopeSizeVelocity(scopeSizeVel.value + (ratio - 1) * 0.6);
+    pinchPrevDist = dist;
     return;
   }
-  const touch = getTouchById(event.changedTouches, touchId1);
-  if (touch === null) {
-    return;
-  }
-  if (new Date().getTime() - touchPrevTime < 0.001) {
-    return;
-  }
-  const deltaTime = Math.max(new Date().getTime() - touchPrevTime, 0.001);
-  const deltaX = (touch.clientX - touchPrev1.clientX) / deltaTime;
-  const deltaY = (touch.clientY - touchPrev1.clientY) / deltaTime;
+  if (len === 1 && touchId1 !== null && touchPrev1 !== null && touchOrigin1 !== null) {
+    const touch = getTouchById(event.touches, touchId1);
+    if (touch === null) {
+      return;
+    }
+    if (new Date().getTime() - touchPrevTime < 0.001) {
+      return;
+    }
+    const deltaTime = Math.max(new Date().getTime() - touchPrevTime, 0.001);
+    const deltaX = (touch.clientX - touchPrev1.clientX) / deltaTime;
 
-  scopeRotation.value += deltaX / 22;
-  if (Math.abs(touch.clientX - touchPrev1.clientX) > 1) {
-    scopeRotationVel.value = clampRotationVelocity(deltaX / 22);
-  } else {
-    scopeRotationVel.value = 0;
-  }
+    scopeRotation.value -= deltaX / 22;
+    if (Math.abs(touch.clientX - touchPrev1.clientX) > 1) {
+      scopeRotationVel.value = clampRotationVelocity(-deltaX / 22);
+    } else {
+      scopeRotationVel.value = 0;
+    }
 
-  scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 7)));
-  if (Math.abs(touch.clientY - touchPrev1.clientY) > 1) {
-    scopeSizeVel.value = deltaY / 7;
-  } else {
-    scopeSizeVel.value = 0;
+    touchPrevTime = new Date().getTime();
+    touchPrev1 = touch;
   }
-
-  touchPrevTime = new Date().getTime();
-  touchPrev1 = touch;
 }
 
 function touchEndCallback(event: TouchEvent) {
+  const len = event.touches.length;
+  if (len === 2) {
+    pinchPrevDist = touchDistance(event.touches[0], event.touches[1]);
+    return;
+  }
+  if (len === 1) {
+    pinchPrevDist = null;
+    const remaining = event.touches[0];
+    touchId1 = remaining.identifier;
+    touchPrev1 = remaining;
+    touchOrigin1 = remaining;
+    touchPrevTime = new Date().getTime();
+    isUserPressing.value = true;
+  }
+  if (len === 0) {
+    isUserPressing.value = false;
+    touchId1 = null;
+    touchPrev1 = null;
+    touchOrigin1 = null;
+    pinchPrevDist = null;
+    return;
+  }
   if (touchId1 === null || touchPrev1 === null || touchOrigin1 === null) {
     return;
   }
@@ -953,12 +986,17 @@ function touchCancelCallback() {
   touchId1 = null;
   touchPrev1 = null;
   touchOrigin1 = null;
+  pinchPrevDist = null;
 }
 
-onMounted(() => {
-  main();
-
-  const canvasElement = canvas.value as HTMLCanvasElement;
+onMounted(async () => {
+  await nextTick();
+  const canvasElement = canvas.value as HTMLCanvasElement | undefined;
+  if (!canvasElement) {
+    console.error('Kaleidoscope: canvas ref not available');
+    return;
+  }
+  main(canvasElement);
 
   canvasElement.addEventListener('mousedown', (mouseEvent) => {
     // Left mouse button only
@@ -987,7 +1025,7 @@ onMounted(() => {
       scopeRotationVel.value = 0;
     }
 
-    scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 + deltaY / 35)));
+    scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1.0 + deltaY / 35)));
     if (Math.abs(mouseEvent.clientY - mousePrevPosition.y) > 1) {
       scopeSizeVel.value = deltaY / 35;
     } else {
@@ -1010,9 +1048,14 @@ onMounted(() => {
 
   document.addEventListener('wheel', (wheelEvent) => {
     wheelEvent.preventDefault();
-    scopeRotation.value += wheelEvent.deltaX / 500;
-    scopeSize.value = Math.max(0.2, Math.min(0.6, scopeSize.value * (1.0 - wheelEvent.deltaY / 500)));
-  });
+    const isZoomGesture = wheelEvent.metaKey || wheelEvent.ctrlKey;
+    if (isZoomGesture) {
+      scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1.0 - wheelEvent.deltaY / 500)));
+      scopeSizeVel.value = clampScopeSizeVelocity(scopeSizeVel.value - wheelEvent.deltaY / 1200);
+    } else {
+      scopeRotation.value -= (wheelEvent.deltaX + wheelEvent.deltaY) / 500;
+    }
+  }, { passive: false });
 
   canvasElement.addEventListener('touchstart', touchStartCallback);
   canvasElement.addEventListener('touchmove', touchMoveCallback);
@@ -1110,35 +1153,55 @@ watch(() => props.uploadedImages, async (newImages) => {
 </script>
 
 <template>
-  <canvas
-    id="maincanvas"
-    ref="canvas"
-    style="width:100dvw;height:100dvh;object-fit:cover;background-color:#EAEAE8"
-  />
-  <video
-    id="camera"
-    visible="False"
-    style="width: 512px; height: 512px; display:none;"
-    controls="true"
-    playsinline
-    crossorigin="anonymous"
-  />
-  <div
-    v-if="uploadedImageElements.length > 1"
-    class="absolute left-1/2 transform -translate-x-1/2 flex gap-2 items-center pointer-events-none z-10"
-    style="top: calc(50% - min(25vw, 25vh) - 3rem);"
-  >
+  <!-- Full-viewport wrapper so #app has height and toolbar stays at bottom -->
+  <div class="w-[100dvw] h-[100dvh] relative">
     <div
-      v-for="(_, index) in uploadedImageElements"
-      :key="index"
-      class="rounded-full transition-all duration-300"
-      :class="{
-        'w-3 h-3 bg-white/80 dark:bg-white/60 shadow-lg': index === (isTransitioning ? nextImageIndex : currentImageIndex),
-        'w-2 h-2 bg-white/40 dark:bg-white/30': index !== (isTransitioning ? nextImageIndex : currentImageIndex)
-      }"
-      :style="{
-        opacity: index === (isTransitioning ? nextImageIndex : currentImageIndex) ? 1 : 0.5
-      }"
+      class="absolute overflow-hidden z-0"
+      style="
+        left: 50%;
+        top: 45%;
+        width: 80vmin;
+        height: 80vmin;
+        min-width: 200px;
+        min-height: 200px;
+        transform: translate(-50%, -50%);
+        border-radius: 50%;
+        background-color: #EAEAE8;
+      "
+    >
+      <canvas
+        id="maincanvas"
+        ref="canvas"
+        class="block w-full h-full object-cover"
+        style="width: 100%; height: 100%; display: block;"
+      />
+      <!-- Dots: inside circle, 48px from top -->
+      <div
+        v-if="uploadedImageElements.length > 1"
+        class="absolute left-1/2 -translate-x-1/2 flex gap-2 items-center pointer-events-none z-10"
+        style="top: 48px;"
+      >
+        <div
+          v-for="(_, index) in uploadedImageElements"
+          :key="index"
+          class="rounded-full transition-all duration-300"
+          :class="{
+            'w-3 h-3 bg-white/80 dark:bg-white/60 shadow-lg': index === (isTransitioning ? nextImageIndex : currentImageIndex),
+            'w-2 h-2 bg-white/40 dark:bg-white/30': index !== (isTransitioning ? nextImageIndex : currentImageIndex)
+          }"
+          :style="{
+            opacity: index === (isTransitioning ? nextImageIndex : currentImageIndex) ? 1 : 0.5
+          }"
+        />
+      </div>
+    </div>
+    <video
+      id="camera"
+      visible="False"
+      style="width: 512px; height: 512px; display:none;"
+      controls="true"
+      playsinline
+      crossorigin="anonymous"
     />
   </div>
 </template>
