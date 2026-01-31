@@ -9,7 +9,9 @@ const props = defineProps<{
   uploadedImages?: string[]
 }>();
 
-const emit = defineEmits(['save-frame']);
+const emit = defineEmits(['save-frame', 'upload-click']);
+
+const CLICK_MOVE_THRESHOLD_PX = 10;
 
 const facingMode = ref('unknown');
 const cameraZoom = ref(1);
@@ -870,6 +872,7 @@ interface Point {
   clientY: number;
 }
 let mousePrevPosition = null as null|{x: number, y: number};
+let mouseStartPosition = null as null|{x: number, y: number};
 let touchId1: null|number = null;
 let touchOrigin1: null|Point = null;
 let touchPrevTime = new Date().getTime();
@@ -961,6 +964,15 @@ function touchEndCallback(event: TouchEvent) {
     isUserPressing.value = true;
   }
   if (len === 0) {
+    if (touchId1 !== null && touchOrigin1 !== null) {
+      const touch = getTouchById(event.changedTouches, touchId1);
+      if (touch !== null) {
+        const dist = Math.hypot(touch.clientX - touchOrigin1.clientX, touch.clientY - touchOrigin1.clientY);
+        if (dist < CLICK_MOVE_THRESHOLD_PX) {
+          emit('upload-click');
+        }
+      }
+    }
     isUserPressing.value = false;
     touchId1 = null;
     touchPrev1 = null;
@@ -1003,10 +1015,9 @@ onMounted(async () => {
     if (mouseEvent.button !== 0) {
       return;
     }
-    mousePrevPosition = {
-      x: mouseEvent.clientX,
-      y: mouseEvent.clientY,
-    };
+    const pos = { x: mouseEvent.clientX, y: mouseEvent.clientY };
+    mousePrevPosition = pos;
+    mouseStartPosition = pos;
     isUserPressing.value = true;
     scopeRotationVel.value = 0;
     scopeSizeVel.value = 0;
@@ -1037,13 +1048,17 @@ onMounted(async () => {
       y: mouseEvent.clientY,
     };
   });
-  document.addEventListener('mouseup', () => {
-    if (mousePrevPosition === null) {
+  document.addEventListener('mouseup', (mouseEvent: MouseEvent) => {
+    if (mousePrevPosition === null || mouseStartPosition === null) {
       return;
     }
-
+    const dist = Math.hypot(mouseEvent.clientX - mouseStartPosition.x, mouseEvent.clientY - mouseStartPosition.y);
+    if (dist < CLICK_MOVE_THRESHOLD_PX) {
+      emit('upload-click');
+    }
     isUserPressing.value = false;
     mousePrevPosition = null;
+    mouseStartPosition = null;
   });
 
   document.addEventListener('wheel', (wheelEvent) => {
@@ -1159,7 +1174,7 @@ watch(() => props.uploadedImages, async (newImages) => {
       class="absolute overflow-hidden z-0"
       style="
         left: 50%;
-        top: 45%;
+        top: 50%;
         width: 80vmin;
         height: 80vmin;
         min-width: 200px;
