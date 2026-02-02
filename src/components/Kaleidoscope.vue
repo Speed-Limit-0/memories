@@ -35,20 +35,29 @@ const keyPressedL = ref(false);
 const keyPressedMinus = ref(false);
 const keyPressedPlus = ref(false);
 const canvas = useTemplateRef('canvas');
+const displayCanvasCenter = useTemplateRef('display-canvas-center');
+const displayCanvasTop = useTemplateRef('display-canvas-top');
+const displayCanvasBottom = useTemplateRef('display-canvas-bottom');
+const interactionLayer = useTemplateRef('interaction-layer');
 const uploadedImageElements = ref([] as HTMLImageElement[]);
-const currentImageIndex = ref(0);
-const cumulativeRotation = ref(0.0);
-const previousRotation = ref(0.0);
-const rotationThreshold = Math.PI / 4; // Switch after 45 degrees (much less rotation needed)
-const lastSwitchTime = ref(0); // Track when we last switched to prevent rapid switching
+const activeImageIndex = ref(0);
+const topSlotIndex = ref(0);
+const centerSlotIndex = ref(0);
+const bottomSlotIndex = ref(0);
+const orbTransitionProgress = ref(0.0);
+const isOrbTransitioning = ref(false);
+const orbTransitionDirection = ref<1 | -1>(1);
+const orbTransitionStartTime = ref(0);
+const ORB_TRANSITION_DURATION_MS = 450;
+const orbScrollVelocity = ref(0);
+const orbScrollProgress = ref(0);
+const ORB_SCROLL_SPRING = 0.08;
+const ORB_SCROLL_DAMPING = 0.85;
+const ORB_SCROLL_IMPULSE = 0.0016;
+const ORB_SWIPE_IMPULSE = 0.012;
+const ORB_SCROLL_FAST_THRESHOLD = 0.08;
 const maxRotationSpeed = 0.01; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
-const transitionProgress = ref(0.0);
-const isTransitioning = ref(false);
-const nextImageIndex = ref(0);
-const transitionStartTime = ref(0);
-const transitionDuration = 500; // Duration in milliseconds for smooth transition
-const rotationDirection = ref(1); // 1 for clockwise (forward), -1 for counter-clockwise (backward)
 let cameraStream: MediaStream | null = null;
 
 const clampRotationVelocity = (velocity: number): number => {
@@ -57,7 +66,6 @@ const clampRotationVelocity = (velocity: number): number => {
 const clampScopeSizeVelocity = (velocity: number): number => {
   return Math.max(-maxScopeSizeVel, Math.min(maxScopeSizeVel, velocity));
 };
-const textureNeedsUpdate = ref(true);
 let texture1: WebGLTexture | null = null;
 let texture2: WebGLTexture | null = null;
 
@@ -95,6 +103,101 @@ const resizeImage = (img: HTMLImageElement): Promise<HTMLImageElement> => {
   });
 };
 
+const getWrappedIndex = (index: number, length: number): number => {
+  if (length <= 0) {
+    return 0;
+  }
+  return ((index % length) + length) % length;
+};
+
+const syncSlotIndices = () => {
+  const totalImages = uploadedImageElements.value.length;
+  if (totalImages <= 0) {
+    topSlotIndex.value = 0;
+    centerSlotIndex.value = 0;
+    bottomSlotIndex.value = 0;
+    return;
+  }
+  centerSlotIndex.value = getWrappedIndex(activeImageIndex.value, totalImages);
+  topSlotIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
+  bottomSlotIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
+};
+
+const startOrbTransition = (direction: 1 | -1) => {
+  if (isOrbTransitioning.value) {
+    return;
+  }
+  if (uploadedImageElements.value.length <= 1) {
+    return;
+  }
+  orbTransitionDirection.value = direction;
+  orbTransitionProgress.value = 0.0;
+  orbTransitionStartTime.value = performance.now();
+  isOrbTransitioning.value = true;
+};
+
+const ORB_SMALL_SCALE = 0.5;
+const ORB_SCOPE_SCALE_MULTIPLIER = 0.5;
+const ORB_TOP_Y = 0;
+const ORB_CENTER_Y = 50;
+const ORB_BOTTOM_Y = 100;
+const ORB_OFFSCREEN_TOP = -50;
+const ORB_OFFSCREEN_BOTTOM = 150;
+
+const lerp = (start: number, end: number, progress: number): number => {
+  return start + (end - start) * progress;
+};
+
+const getOrbStyle = (slot: 'top' | 'center' | 'bottom') => {
+  const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
+  const direction = orbTransitionDirection.value;
+
+  let topPercent = slot === 'top' ? ORB_TOP_Y : slot === 'center' ? ORB_CENTER_Y : ORB_BOTTOM_Y;
+  let scale = slot === 'center' ? 1 : ORB_SMALL_SCALE;
+
+  if (progress > 0) {
+    if (direction === 1) {
+      if (slot === 'top') {
+        topPercent = lerp(ORB_TOP_Y, ORB_OFFSCREEN_TOP, progress);
+      } else if (slot === 'center') {
+        topPercent = lerp(ORB_CENTER_Y, ORB_TOP_Y, progress);
+        scale = lerp(1, ORB_SMALL_SCALE, progress);
+      } else {
+        topPercent = lerp(ORB_BOTTOM_Y, ORB_CENTER_Y, progress);
+        scale = lerp(ORB_SMALL_SCALE, 1, progress);
+      }
+    } else {
+      if (slot === 'bottom') {
+        topPercent = lerp(ORB_BOTTOM_Y, ORB_OFFSCREEN_BOTTOM, progress);
+      } else if (slot === 'center') {
+        topPercent = lerp(ORB_CENTER_Y, ORB_BOTTOM_Y, progress);
+        scale = lerp(1, ORB_SMALL_SCALE, progress);
+      } else {
+        topPercent = lerp(ORB_TOP_Y, ORB_CENTER_Y, progress);
+        scale = lerp(ORB_SMALL_SCALE, 1, progress);
+      }
+    }
+  }
+
+  return {
+    top: `${topPercent}%`,
+    transform: `translate(-50%, -50%) scale(${scale})`,
+  };
+};
+
+const SWIPE_DISTANCE_PX = 60;
+const isSwipeGesture = (deltaX: number, deltaY: number): boolean => {
+  return Math.abs(deltaY) >= SWIPE_DISTANCE_PX && Math.abs(deltaY) > Math.abs(deltaX);
+};
+
+const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
+  if (!isSwipeGesture(deltaX, deltaY)) {
+    return false;
+  }
+  orbScrollVelocity.value += Math.max(-1, Math.min(1, deltaY / 200)) * ORB_SWIPE_IMPULSE;
+  return true;
+};
+
 const loadUploadedImages = async (imageSrcs: string[]) => {
   if (imageSrcs.length > 0) {
     const loadedImages: HTMLImageElement[] = [];
@@ -111,10 +214,11 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
       loadedImages.push(resizedImg);
     }
     uploadedImageElements.value = loadedImages;
-    currentImageIndex.value = 0;
-    cumulativeRotation.value = 0.0;
+    activeImageIndex.value = 0;
+    syncSlotIndices();
+    orbTransitionProgress.value = 0.0;
+    isOrbTransitioning.value = false;
     facingMode.value = 'environment'; // Don't flip uploaded images (x-flip is only for user-facing webcam)
-    textureNeedsUpdate.value = true; // Mark texture for update
     
     // Stop camera stream if images are uploaded
     if (cameraStream) {
@@ -123,8 +227,10 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
     }
   } else {
     uploadedImageElements.value = [];
-    currentImageIndex.value = 0;
-    textureNeedsUpdate.value = true; // Mark texture for update when switching back to camera
+    activeImageIndex.value = 0;
+    syncSlotIndices();
+    orbTransitionProgress.value = 0.0;
+    isOrbTransitioning.value = false;
   }
 };
 
@@ -657,6 +763,53 @@ async function main(canvasElement: HTMLCanvasElement) {
   }
 
   // Repeatedly pull camera data and render
+  const renderToDisplayCanvas = (displayCanvas: HTMLCanvasElement | null, sourceCanvas: HTMLCanvasElement) => {
+    if (!displayCanvas) {
+      return;
+    }
+    const ctx = displayCanvas.getContext('2d');
+    if (!ctx) {
+      return;
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const targetWidth = Math.max(1, Math.floor(displayCanvas.clientWidth * dpr));
+    const targetHeight = Math.max(1, Math.floor(displayCanvas.clientHeight * dpr));
+    if (displayCanvas.width !== targetWidth || displayCanvas.height !== targetHeight) {
+      displayCanvas.width = targetWidth;
+      displayCanvas.height = targetHeight;
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, targetWidth, targetHeight);
+    ctx.drawImage(sourceCanvas, 0, 0, targetWidth, targetHeight);
+  };
+
+  const drawOrbFrame = (
+    displayCanvas: HTMLCanvasElement | null,
+    imageSource: HTMLImageElement | HTMLVideoElement,
+    scopeScaleMultiplier: number
+  ) => {
+    const isVideo = imageSource instanceof HTMLVideoElement;
+    const imageWidth = isVideo ? imageSource.videoWidth : imageSource.width;
+    const imageHeight = isVideo ? imageSource.videoHeight : imageSource.height;
+    if (imageWidth <= 0 || imageHeight <= 0) {
+      return;
+    }
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageSource);
+
+    gl.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
+    gl.uniform2f(dataDimensions2Bind, imageWidth, imageHeight);
+    gl.uniform1f(dataZoomBind, cameraZoom.value);
+    gl.uniform1f(scopeSizeBind, scopeSize.value * scopeScaleMultiplier);
+    if (transitionProgressBind) {
+      gl.uniform1f(transitionProgressBind, 0.0);
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    renderToDisplayCanvas(displayCanvas, canvasElement);
+  };
+
   function animate(){
     // Handle keyboard state
     if (keyPressedA.value && keyPressedD.value) {
@@ -716,144 +869,59 @@ async function main(canvasElement: HTMLCanvasElement) {
     scopeOffsetVel.value[0] *= 0.95;
     scopeOffsetVel.value[1] *= 0.95;
 
-    // Track cumulative rotation for image switching
-    // Only accumulate rotation when not transitioning to prevent multiple rapid switches
-    if (!isTransitioning.value) {
-      const rotationDelta = scopeRotation.value - previousRotation.value;
-      // Normalize rotation delta to handle wraparound
-      let normalizedDelta = rotationDelta;
-      if (normalizedDelta > Math.PI) normalizedDelta -= Math.PI * 2;
-      if (normalizedDelta < -Math.PI) normalizedDelta += Math.PI * 2;
-      
-      // Track rotation direction based on the sign of the delta
-      if (Math.abs(normalizedDelta) > 0.001) { // Only update if there's meaningful rotation
-        rotationDirection.value = normalizedDelta > 0 ? 1 : -1; // 1 = clockwise, -1 = counter-clockwise
-      }
-      
-      cumulativeRotation.value += Math.abs(normalizedDelta);
-      previousRotation.value = scopeRotation.value;
-    } else {
-      // Still update previousRotation during transitions to prevent large jumps when transition completes
-      previousRotation.value = scopeRotation.value;
-    }
-
-    // Check if we should switch images (only if we have multiple uploaded images)
-    if (uploadedImageElements.value.length > 1 && !isTransitioning.value) {
-      const now = Date.now();
-      const timeSinceLastSwitch = now - lastSwitchTime.value;
-      const minSwitchInterval = 100; // Minimum 100ms between switches to prevent rapid cycling
-      
-      if (cumulativeRotation.value >= rotationThreshold && timeSinceLastSwitch >= minSwitchInterval) {
-        // Start transition to next/previous image based on rotation direction
-        // Clockwise rotation should move dot left (decrement index)
-        // Counter-clockwise rotation should move dot right (increment index)
+    if (isOrbTransitioning.value) {
+      const now = performance.now();
+      const elapsed = now - orbTransitionStartTime.value;
+      orbTransitionProgress.value = Math.min(elapsed / ORB_TRANSITION_DURATION_MS, 1.0);
+      if (orbTransitionProgress.value >= 1.0) {
         const totalImages = uploadedImageElements.value.length;
-        if (rotationDirection.value > 0) {
-          // Clockwise rotation - move dot left (decrement)
-          nextImageIndex.value = (currentImageIndex.value - 1 + totalImages) % totalImages;
-        } else {
-          // Counter-clockwise rotation - move dot right (increment)
-          nextImageIndex.value = (currentImageIndex.value + 1) % totalImages;
+        if (totalImages > 0) {
+          const delta = orbTransitionDirection.value === 1 ? 1 : -1;
+          activeImageIndex.value = getWrappedIndex(activeImageIndex.value + delta, totalImages);
         }
-        isTransitioning.value = true;
-        transitionProgress.value = 0.0;
-        transitionStartTime.value = now;
-        cumulativeRotation.value = 0.0;
-        lastSwitchTime.value = now;
-        
-        // Upload next image to texture2 for transition
-        if (uploadedImageElements.value[nextImageIndex.value] && texture2) {
-          gl.activeTexture(gl.TEXTURE1);
-          gl.bindTexture(gl.TEXTURE_2D, texture2);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImageElements.value[nextImageIndex.value]);
+        syncSlotIndices();
+        isOrbTransitioning.value = false;
+        orbTransitionProgress.value = 0.0;
+        if (Math.abs(orbScrollVelocity.value) > ORB_SCROLL_FAST_THRESHOLD) {
+          startOrbTransition(orbScrollVelocity.value > 0 ? 1 : -1);
         }
       }
     }
 
-    // Handle transition progress - time-based for smooth animation
-    if (isTransitioning.value) {
-      const now = Date.now();
-      const elapsed = now - transitionStartTime.value;
-      transitionProgress.value = Math.min(elapsed / transitionDuration, 1.0);
-      
-      if (transitionProgress.value >= 1.0) {
-        // Transition complete - switch to next image
-        currentImageIndex.value = nextImageIndex.value;
-        transitionProgress.value = 0.0;
-        isTransitioning.value = false;
-        cumulativeRotation.value = 0.0; // Reset cumulative rotation after transition completes
-        textureNeedsUpdate.value = true;
-        
-        // Update texture1 with the new current image
-        if (texture1 && uploadedImageElements.value[currentImageIndex.value]) {
-          gl.activeTexture(gl.TEXTURE0);
-          gl.bindTexture(gl.TEXTURE_2D, texture1);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImageElements.value[currentImageIndex.value]);
-          textureNeedsUpdate.value = false;
-        }
+    if (!isOrbTransitioning.value) {
+      orbScrollVelocity.value += -orbScrollProgress.value * ORB_SCROLL_SPRING;
+      orbScrollProgress.value += orbScrollVelocity.value;
+      orbScrollVelocity.value *= ORB_SCROLL_DAMPING;
+      if (Math.abs(orbScrollVelocity.value) < 0.00001) {
+        orbScrollVelocity.value = 0;
       }
-    }
-
-    // Use uploaded image if available, otherwise use camera
-    const hasUploadedImages = uploadedImageElements.value.length > 0;
-    const currentImage = hasUploadedImages ? uploadedImageElements.value[currentImageIndex.value] : null;
-    const imageSource = currentImage || camera;
-    let imageWidth: number;
-    let imageHeight: number;
-    
-    if (currentImage) {
-      imageWidth = currentImage.width;
-      imageHeight = currentImage.height;
+      if (Math.abs(orbScrollProgress.value) >= 1) {
+        const direction = orbScrollProgress.value > 0 ? 1 : -1;
+        orbScrollProgress.value = 0;
+        orbScrollVelocity.value *= 0.6;
+        startOrbTransition(direction);
+      }
     } else {
-      imageWidth = camera.videoWidth || 1;
-      imageHeight = camera.videoHeight || 1;
+      orbScrollVelocity.value *= ORB_SCROLL_DAMPING;
     }
 
-    // Get next image dimensions for texture2 during transition
-    let image2Width = imageWidth;
-    let image2Height = imageHeight;
-    if (isTransitioning.value && uploadedImageElements.value[nextImageIndex.value]) {
-      const nextImage = uploadedImageElements.value[nextImageIndex.value];
-      image2Width = nextImage.width;
-      image2Height = nextImage.height;
-    }
+    const hasUploadedImages = uploadedImageElements.value.length > 0;
+    const topImage = hasUploadedImages ? uploadedImageElements.value[topSlotIndex.value] : null;
+    const centerImage = hasUploadedImages ? uploadedImageElements.value[centerSlotIndex.value] : null;
+    const bottomImage = hasUploadedImages ? uploadedImageElements.value[bottomSlotIndex.value] : null;
+    const fallbackSource = camera;
 
-    // Only render if we have valid dimensions
-    if (imageWidth > 0 && imageHeight > 0) {
-      // Update texture1 (current image)
-      // Only update texture when necessary to avoid blocking
-      const isVideo = !hasUploadedImages;
-      if (isVideo) {
-        // For video, update every frame (but this is necessary for live video)
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, texture1);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageSource);
-      } else if (textureNeedsUpdate.value && currentImage) {
-        // For uploaded images, only update when the image changes
-        // Double-check that the image exists and is valid
-        if (currentImage.width > 0 && currentImage.height > 0) {
-          gl.activeTexture(gl.TEXTURE0);
-          gl.bindTexture(gl.TEXTURE_2D, texture1);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, currentImage);
-          textureNeedsUpdate.value = false;
-        }
-      }
-      
-      gl.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
-      gl.uniform2f(dataDimensions2Bind, image2Width, image2Height);
-      gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
-      gl.uniform1f(dataZoomBind, cameraZoom.value);
-      gl.uniform1i(scopeShapeBind, props.scopeShape);
-      gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
-      gl.uniform1f(scopeSizeBind, scopeSize.value);
-      gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
-      gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
-      if (transitionProgressBind) {
-        gl.uniform1f(transitionProgressBind, transitionProgress.value);
-      }
-      gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    }
+    gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
+    gl.uniform1i(scopeShapeBind, props.scopeShape);
+    gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
+    gl.uniform1f(scopeSizeBind, scopeSize.value);
+    gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
+    gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
+    gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
+
+    drawOrbFrame(displayCanvasTop.value ?? null, topImage ?? fallbackSource, ORB_SCOPE_SCALE_MULTIPLIER);
+    drawOrbFrame(displayCanvasBottom.value ?? null, bottomImage ?? fallbackSource, ORB_SCOPE_SCALE_MULTIPLIER);
+    drawOrbFrame(displayCanvasCenter.value ?? null, centerImage ?? fallbackSource, 1);
 
     if (props.saveNextFrame) {
       emit(
@@ -916,6 +984,7 @@ function touchStartCallback(event: TouchEvent) {
 }
 
 function touchMoveCallback(event: TouchEvent) {
+  event.preventDefault();
   const len = event.touches.length;
   if (len === 2 && pinchPrevDist !== null) {
     const dist = touchDistance(event.touches[0], event.touches[1]);
@@ -967,8 +1036,11 @@ function touchEndCallback(event: TouchEvent) {
     if (touchId1 !== null && touchOrigin1 !== null) {
       const touch = getTouchById(event.changedTouches, touchId1);
       if (touch !== null) {
-        const dist = Math.hypot(touch.clientX - touchOrigin1.clientX, touch.clientY - touchOrigin1.clientY);
-        if (dist < CLICK_MOVE_THRESHOLD_PX) {
+        const deltaX = touch.clientX - touchOrigin1.clientX;
+        const deltaY = touch.clientY - touchOrigin1.clientY;
+        const dist = Math.hypot(deltaX, deltaY);
+        const didSwipe = handleSwipeGesture(deltaX, deltaY);
+        if (!didSwipe && dist < CLICK_MOVE_THRESHOLD_PX) {
           emit('upload-click');
         }
       }
@@ -1009,8 +1081,13 @@ onMounted(async () => {
     return;
   }
   main(canvasElement);
+  const interactionElement = interactionLayer.value as HTMLDivElement | undefined;
+  if (!interactionElement) {
+    console.error('Kaleidoscope: interaction layer ref not available');
+    return;
+  }
 
-  canvasElement.addEventListener('mousedown', (mouseEvent) => {
+  interactionElement.addEventListener('mousedown', (mouseEvent) => {
     // Left mouse button only
     if (mouseEvent.button !== 0) {
       return;
@@ -1022,38 +1099,37 @@ onMounted(async () => {
     scopeRotationVel.value = 0;
     scopeSizeVel.value = 0;
   });
+  let mousePrevTime = performance.now();
   document.addEventListener('mousemove', (mouseEvent) => {
     if (mousePrevPosition === null) {
       return;
     }
+    const now = performance.now();
+    const deltaTime = Math.max(1, now - mousePrevTime);
     const deltaX = (mouseEvent.clientX - mousePrevPosition.x) / 10;
-    const deltaY = (mouseEvent.clientY - mousePrevPosition.y) / 10;
 
     scopeRotation.value += deltaX / 35;
     if (Math.abs(mouseEvent.clientX - mousePrevPosition.x) > 1) {
-      scopeRotationVel.value = clampRotationVelocity(deltaX / 35);
+      scopeRotationVel.value = clampRotationVelocity((deltaX / deltaTime) * 0.35);
     } else {
       scopeRotationVel.value = 0;
-    }
-
-    scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1.0 + deltaY / 35)));
-    if (Math.abs(mouseEvent.clientY - mousePrevPosition.y) > 1) {
-      scopeSizeVel.value = deltaY / 35;
-    } else {
-      scopeSizeVel.value = 0;
     }
 
     mousePrevPosition = {
       x: mouseEvent.clientX,
       y: mouseEvent.clientY,
     };
+    mousePrevTime = now;
   });
   document.addEventListener('mouseup', (mouseEvent: MouseEvent) => {
     if (mousePrevPosition === null || mouseStartPosition === null) {
       return;
     }
-    const dist = Math.hypot(mouseEvent.clientX - mouseStartPosition.x, mouseEvent.clientY - mouseStartPosition.y);
-    if (dist < CLICK_MOVE_THRESHOLD_PX) {
+    const deltaX = mouseEvent.clientX - mouseStartPosition.x;
+    const deltaY = mouseEvent.clientY - mouseStartPosition.y;
+    const dist = Math.hypot(deltaX, deltaY);
+    const didSwipe = handleSwipeGesture(deltaX, deltaY);
+    if (!didSwipe && dist < CLICK_MOVE_THRESHOLD_PX) {
       emit('upload-click');
     }
     isUserPressing.value = false;
@@ -1063,19 +1139,17 @@ onMounted(async () => {
 
   document.addEventListener('wheel', (wheelEvent) => {
     wheelEvent.preventDefault();
-    const isZoomGesture = wheelEvent.metaKey || wheelEvent.ctrlKey;
-    if (isZoomGesture) {
-      scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1.0 - wheelEvent.deltaY / 500)));
-      scopeSizeVel.value = clampScopeSizeVelocity(scopeSizeVel.value - wheelEvent.deltaY / 1200);
-    } else {
-      scopeRotation.value -= (wheelEvent.deltaX + wheelEvent.deltaY) / 500;
+    if (Math.abs(wheelEvent.deltaY) < 4) {
+      return;
     }
+    const clampedDelta = Math.max(-80, Math.min(80, wheelEvent.deltaY));
+    orbScrollVelocity.value += clampedDelta * ORB_SCROLL_IMPULSE;
   }, { passive: false });
 
-  canvasElement.addEventListener('touchstart', touchStartCallback);
-  canvasElement.addEventListener('touchmove', touchMoveCallback);
-  canvasElement.addEventListener('touchend', touchEndCallback);
-  canvasElement.addEventListener('touchcancel', touchCancelCallback);
+  interactionElement.addEventListener('touchstart', touchStartCallback);
+  interactionElement.addEventListener('touchmove', touchMoveCallback);
+  interactionElement.addEventListener('touchend', touchEndCallback);
+  interactionElement.addEventListener('touchcancel', touchCancelCallback);
 
   document.addEventListener('keydown', (keyEvent) => {
     if (keyEvent.code == 'KeyW') {
@@ -1139,10 +1213,10 @@ watch(() => props.uploadedImages, async (newImages) => {
     await loadUploadedImages(newImages);
   } else {
     uploadedImageElements.value = [];
-    currentImageIndex.value = 0;
-    cumulativeRotation.value = 0.0;
-    transitionProgress.value = 0.0;
-    isTransitioning.value = false;
+    activeImageIndex.value = 0;
+    syncSlotIndices();
+    orbTransitionProgress.value = 0.0;
+    isOrbTransitioning.value = false;
     // Restart camera if no images are uploaded
     const camera = document.getElementById('camera') as HTMLVideoElement | null;
     if (camera && !cameraStream) {
@@ -1169,47 +1243,49 @@ watch(() => props.uploadedImages, async (newImages) => {
 
 <template>
   <!-- Full-viewport wrapper so #app has height and toolbar stays at bottom -->
-  <div class="w-[100dvw] h-[100dvh] relative">
+  <div class="w-[100dvw] h-[100dvh] relative overflow-hidden">
+    <div ref="interaction-layer" class="absolute inset-0 z-20 touch-none select-none" />
+    <!-- Top orb (bottom hemisphere visible) -->
     <div
-      class="absolute overflow-hidden z-0"
-      style="
-        left: 50%;
-        top: 50%;
-        width: 80vmin;
-        height: 80vmin;
-        min-width: 200px;
-        min-height: 200px;
-        transform: translate(-50%, -50%);
-        border-radius: 50%;
-        background-color: #EAEAE8;
-      "
+      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-0 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      :style="getOrbStyle('top')"
+      aria-hidden="true"
     >
       <canvas
-        id="maincanvas"
-        ref="canvas"
+        ref="display-canvas-top"
         class="block w-full h-full object-cover"
-        style="width: 100%; height: 100%; display: block;"
       />
-      <!-- Dots: inside circle, 48px from top -->
-      <div
-        v-if="uploadedImageElements.length > 1"
-        class="absolute left-1/2 -translate-x-1/2 flex gap-2 items-center pointer-events-none z-10"
-        style="top: 48px;"
-      >
-        <div
-          v-for="(_, index) in uploadedImageElements"
-          :key="index"
-          class="rounded-full transition-all duration-300"
-          :class="{
-            'w-3 h-3 bg-white/80 dark:bg-white/60 shadow-lg': index === (isTransitioning ? nextImageIndex : currentImageIndex),
-            'w-2 h-2 bg-white/40 dark:bg-white/30': index !== (isTransitioning ? nextImageIndex : currentImageIndex)
-          }"
-          :style="{
-            opacity: index === (isTransitioning ? nextImageIndex : currentImageIndex) ? 1 : 0.5
-          }"
-        />
-      </div>
     </div>
+
+    <!-- Center orb (full) -->
+    <div
+      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-10 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      :style="getOrbStyle('center')"
+    >
+      <canvas
+        ref="display-canvas-center"
+        class="block w-full h-full object-cover"
+      />
+    </div>
+
+    <!-- Bottom orb (top hemisphere visible) -->
+    <div
+      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-0 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      :style="getOrbStyle('bottom')"
+      aria-hidden="true"
+    >
+      <canvas
+        ref="display-canvas-bottom"
+        class="block w-full h-full object-cover"
+      />
+    </div>
+
+    <!-- Hidden WebGL canvas used as source -->
+    <canvas
+      id="maincanvas"
+      ref="canvas"
+      class="absolute -left-[9999px] -top-[9999px] opacity-0 pointer-events-none"
+    />
     <video
       id="camera"
       visible="False"
