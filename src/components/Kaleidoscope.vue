@@ -9,7 +9,7 @@ const props = defineProps<{
   uploadedImages?: string[]
 }>();
 
-const emit = defineEmits(['save-frame', 'upload-click']);
+const emit = defineEmits(['save-frame', 'upload-click', 'remove-uploaded-image']);
 
 const CLICK_MOVE_THRESHOLD_PX = 10;
 
@@ -39,6 +39,7 @@ const displayCanvasCenter = useTemplateRef('display-canvas-center');
 const displayCanvasTop = useTemplateRef('display-canvas-top');
 const displayCanvasBottom = useTemplateRef('display-canvas-bottom');
 const interactionLayer = useTemplateRef('interaction-layer');
+const centerOrb = useTemplateRef('center-orb');
 const uploadedImageElements = ref([] as HTMLImageElement[]);
 const activeImageIndex = ref(0);
 const topSlotIndex = ref(0);
@@ -59,6 +60,19 @@ const ORB_SCROLL_FAST_THRESHOLD = 0.08;
 const maxRotationSpeed = 0.01; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
+
+// Horizontal drag-to-dismiss (removes the active uploaded image)
+const ORB_DISMISS_DURATION_MS = 200;
+const orbDragTranslateX = ref(0);
+const orbDragTranslateY = ref(0);
+const orbDragScaleMultiplier = ref(1);
+const isOrbDragging = ref(false);
+const isOrbDismissing = ref(false);
+let orbDragMouseStart: null | { x: number; y: number } = null;
+let orbDragMouseActive = false;
+let orbDragTouchActive = false;
+let orbDragTouchLast: null | Point = null;
+const pendingOrbRemovalIndex = ref<number | null>(null);
 
 const clampRotationVelocity = (velocity: number): number => {
   return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
@@ -179,9 +193,14 @@ const getOrbStyle = (slot: 'top' | 'center' | 'bottom') => {
     }
   }
 
+  const extraTranslateX = slot === 'center' ? orbDragTranslateX.value : 0;
+  const extraTranslateY = slot === 'center' ? orbDragTranslateY.value : 0;
+  // Only the center orb shrinks during drag/dismiss; top/bottom remain fixed
+  const extraScale = slot === 'center' ? orbDragScaleMultiplier.value : 1;
+
   return {
     top: `${topPercent}%`,
-    transform: `translate(-50%, -50%) scale(${scale})`,
+    transform: `translate(-50%, -50%) translate(${extraTranslateX}px, ${extraTranslateY}px) scale(${scale * extraScale})`,
   };
 };
 
@@ -196,6 +215,101 @@ const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
   }
   orbScrollVelocity.value += Math.max(-1, Math.min(1, deltaY / 200)) * ORB_SWIPE_IMPULSE;
   return true;
+};
+
+const isPointInsideCenterOrb = (p: Point): boolean => {
+  const el = centerOrb.value as HTMLDivElement | undefined;
+  if (!el) return false;
+  const rect = el.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const r = Math.min(rect.width, rect.height) / 2;
+  return Math.hypot(p.clientX - cx, p.clientY - cy) <= r;
+};
+
+const getCenterOrbDismissThresholdPx = (): number => {
+  const el = centerOrb.value as HTMLDivElement | undefined;
+  if (!el) return 140;
+  const rect = el.getBoundingClientRect();
+  return Math.max(90, Math.min(220, rect.width * 0.28));
+};
+
+const getOrbDragArcOffsetY = (deltaX: number) => {
+  if (typeof window === 'undefined') return 0;
+  const el = centerOrb.value as HTMLDivElement | undefined;
+  const viewportWidth = window.innerWidth || 1;
+  const maxHorizontal = viewportWidth * 0.5;
+  // From vertical center (~50vh) down to bottom (~100vh)
+  const maxDownPx = window.innerHeight * 0.5;
+  const norm = Math.min(1, Math.abs(deltaX) / Math.max(1, maxHorizontal));
+  // Slightly eased curve
+  const curved = norm * norm;
+  return curved * maxDownPx;
+};
+
+const setOrbDragVisuals = (deltaX: number) => {
+  orbDragTranslateX.value = deltaX;
+  orbDragTranslateY.value = getOrbDragArcOffsetY(deltaX);
+  // Allow the orb stack to get noticeably smaller as it approaches the corners
+  const shrink = Math.min(0.7, Math.abs(deltaX) / 400);
+  orbDragScaleMultiplier.value = Math.max(0.25, 1 - shrink);
+};
+
+const resetOrbDragVisuals = () => {
+  orbDragTranslateX.value = 0;
+  orbDragTranslateY.value = 0;
+  orbDragScaleMultiplier.value = 1;
+};
+
+const removeUploadedImageAtIndex = (removeIndex: number) => {
+  const total = uploadedImageElements.value.length;
+  if (total <= 0) return;
+  const wrappedRemoveIndex = getWrappedIndex(removeIndex, total);
+  const wrappedActiveIndex = getWrappedIndex(activeImageIndex.value, total);
+
+  uploadedImageElements.value.splice(wrappedRemoveIndex, 1);
+
+  const newTotal = uploadedImageElements.value.length;
+  if (newTotal <= 0) {
+    activeImageIndex.value = 0;
+    syncSlotIndices();
+    orbTransitionProgress.value = 0.0;
+    isOrbTransitioning.value = false;
+    return;
+  }
+
+  if (wrappedRemoveIndex < wrappedActiveIndex) {
+    activeImageIndex.value = Math.max(0, wrappedActiveIndex - 1);
+  } else if (wrappedRemoveIndex === wrappedActiveIndex) {
+    activeImageIndex.value = Math.min(wrappedActiveIndex, newTotal - 1);
+  } else {
+    activeImageIndex.value = Math.min(wrappedActiveIndex, newTotal - 1);
+  }
+
+  syncSlotIndices();
+  orbTransitionProgress.value = 0.0;
+  isOrbTransitioning.value = false;
+};
+
+const dismissActiveOrb = async (direction: 1 | -1, removeIndex: number) => {
+  if (isOrbTransitioning.value || isOrbDismissing.value) return;
+  if (uploadedImageElements.value.length <= 0) return;
+
+  isOrbDismissing.value = true;
+  // Ensure we animate out even if released near center
+  orbDragTranslateX.value = direction * Math.max(window.innerWidth, 600);
+  orbDragTranslateY.value = getOrbDragArcOffsetY(orbDragTranslateX.value);
+  orbDragScaleMultiplier.value = 0;
+
+  await new Promise((resolve) => setTimeout(resolve, ORB_DISMISS_DURATION_MS));
+
+  // Remove locally immediately for responsiveness, and notify parent to update `uploadedImages`.
+  pendingOrbRemovalIndex.value = removeIndex;
+  removeUploadedImageAtIndex(removeIndex);
+  emit('remove-uploaded-image', removeIndex);
+
+  isOrbDismissing.value = false;
+  resetOrbDragVisuals();
 };
 
 const loadUploadedImages = async (imageSrcs: string[]) => {
@@ -964,6 +1078,10 @@ function touchStartCallback(event: TouchEvent) {
   event.preventDefault();
   const len = event.touches.length;
   if (len === 2) {
+    orbDragTouchActive = false;
+    orbDragTouchLast = null;
+    isOrbDragging.value = false;
+    resetOrbDragVisuals();
     touchId1 = null;
     touchPrev1 = null;
     touchOrigin1 = null;
@@ -973,6 +1091,21 @@ function touchStartCallback(event: TouchEvent) {
   }
   if (len === 1 && touchId1 === null && pinchPrevDist === null) {
     const touch = event.changedTouches[0];
+    // If user starts within the center orb and we have an uploaded stack, treat horizontal drag as dismiss gesture.
+    if (
+      uploadedImageElements.value.length > 0 &&
+      !isOrbTransitioning.value &&
+      !isOrbDismissing.value &&
+      isPointInsideCenterOrb(touch)
+    ) {
+      orbDragTouchActive = true;
+      orbDragTouchLast = touch;
+      isOrbDragging.value = true;
+    } else {
+      orbDragTouchActive = false;
+      orbDragTouchLast = null;
+      isOrbDragging.value = false;
+    }
     touchId1 = touch.identifier;
     touchPrev1 = touch;
     touchOrigin1 = touch;
@@ -997,6 +1130,11 @@ function touchMoveCallback(event: TouchEvent) {
   if (len === 1 && touchId1 !== null && touchPrev1 !== null && touchOrigin1 !== null) {
     const touch = getTouchById(event.touches, touchId1);
     if (touch === null) {
+      return;
+    }
+    if (orbDragTouchActive) {
+      orbDragTouchLast = touch;
+      setOrbDragVisuals(touch.clientX - touchOrigin1.clientX);
       return;
     }
     if (new Date().getTime() - touchPrevTime < 0.001) {
@@ -1033,7 +1171,23 @@ function touchEndCallback(event: TouchEvent) {
     isUserPressing.value = true;
   }
   if (len === 0) {
-    if (touchId1 !== null && touchOrigin1 !== null) {
+    if (orbDragTouchActive && touchOrigin1 !== null) {
+      const last = orbDragTouchLast ?? (touchId1 !== null ? getTouchById(event.changedTouches, touchId1) : null);
+      const deltaX = last ? last.clientX - touchOrigin1.clientX : orbDragTranslateX.value;
+      const threshold = getCenterOrbDismissThresholdPx();
+      const direction: 1 | -1 = deltaX >= 0 ? 1 : -1;
+      const removeIndex = centerSlotIndex.value;
+
+      orbDragTouchActive = false;
+      orbDragTouchLast = null;
+      isOrbDragging.value = false;
+
+      if (Math.abs(deltaX) >= threshold && uploadedImageElements.value.length > 0) {
+        void dismissActiveOrb(direction, removeIndex);
+      } else {
+        resetOrbDragVisuals();
+      }
+    } else if (touchId1 !== null && touchOrigin1 !== null) {
       const touch = getTouchById(event.changedTouches, touchId1);
       if (touch !== null) {
         const deltaX = touch.clientX - touchOrigin1.clientX;
@@ -1093,14 +1247,34 @@ onMounted(async () => {
       return;
     }
     const pos = { x: mouseEvent.clientX, y: mouseEvent.clientY };
-    mousePrevPosition = pos;
-    mouseStartPosition = pos;
+    const shouldOrbDrag =
+      uploadedImageElements.value.length > 0 &&
+      !isOrbTransitioning.value &&
+      !isOrbDismissing.value &&
+      isPointInsideCenterOrb(mouseEvent);
+    if (shouldOrbDrag) {
+      orbDragMouseActive = true;
+      orbDragMouseStart = pos;
+      isOrbDragging.value = true;
+      mousePrevPosition = null;
+      mouseStartPosition = null;
+    } else {
+      orbDragMouseActive = false;
+      orbDragMouseStart = null;
+      isOrbDragging.value = false;
+      mousePrevPosition = pos;
+      mouseStartPosition = pos;
+    }
     isUserPressing.value = true;
     scopeRotationVel.value = 0;
     scopeSizeVel.value = 0;
   });
   let mousePrevTime = performance.now();
   document.addEventListener('mousemove', (mouseEvent) => {
+    if (orbDragMouseActive && orbDragMouseStart !== null) {
+      setOrbDragVisuals(mouseEvent.clientX - orbDragMouseStart.x);
+      return;
+    }
     if (mousePrevPosition === null) {
       return;
     }
@@ -1122,6 +1296,25 @@ onMounted(async () => {
     mousePrevTime = now;
   });
   document.addEventListener('mouseup', (mouseEvent: MouseEvent) => {
+    if (orbDragMouseActive && orbDragMouseStart !== null) {
+      const deltaX = mouseEvent.clientX - orbDragMouseStart.x;
+      const threshold = getCenterOrbDismissThresholdPx();
+      const direction: 1 | -1 = deltaX >= 0 ? 1 : -1;
+      const removeIndex = centerSlotIndex.value;
+
+      orbDragMouseActive = false;
+      orbDragMouseStart = null;
+      isOrbDragging.value = false;
+
+      if (Math.abs(deltaX) >= threshold && uploadedImageElements.value.length > 0) {
+        void dismissActiveOrb(direction, removeIndex);
+      } else {
+        resetOrbDragVisuals();
+      }
+
+      isUserPressing.value = false;
+      return;
+    }
     if (mousePrevPosition === null || mouseStartPosition === null) {
       return;
     }
@@ -1208,7 +1401,40 @@ onMounted(async () => {
 });
 
 // Watch for changes to uploaded images
-watch(() => props.uploadedImages, async (newImages) => {
+watch(() => props.uploadedImages, async (newImages, oldImages) => {
+  // Fast-path: a single removal (avoids reloading & preserves active index)
+  if (newImages && oldImages && oldImages.length - newImages.length === 1) {
+    let removedIndex: number | null = null;
+    let j = 0;
+    for (let i = 0; i < oldImages.length; i += 1) {
+      if (j >= newImages.length || oldImages[i] !== newImages[j]) {
+        removedIndex = i;
+        break;
+      }
+      j += 1;
+    }
+    if (removedIndex === null) {
+      removedIndex = oldImages.length - 1;
+    }
+
+    // If we already removed locally as part of a dismiss gesture, just clear the pending marker.
+    if (pendingOrbRemovalIndex.value !== null && removedIndex === pendingOrbRemovalIndex.value) {
+      pendingOrbRemovalIndex.value = null;
+      if (newImages.length > 0) {
+        syncSlotIndices();
+        orbTransitionProgress.value = 0.0;
+        isOrbTransitioning.value = false;
+        return;
+      }
+    }
+
+    // Otherwise apply the same removal locally without reloading images.
+    if (uploadedImageElements.value.length > 0) {
+      removeUploadedImageAtIndex(removedIndex);
+      return;
+    }
+  }
+
   if (newImages && newImages.length > 0) {
     await loadUploadedImages(newImages);
   } else {
@@ -1259,7 +1485,9 @@ watch(() => props.uploadedImages, async (newImages) => {
 
     <!-- Center orb (full) -->
     <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-10 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      ref="center-orb"
+      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-10 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px] will-change-transform"
+      :class="isOrbDragging ? '' : 'transition-transform duration-200 ease-out'"
       :style="getOrbStyle('center')"
     >
       <canvas

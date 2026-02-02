@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import Kaleidoscope from './components/Kaleidoscope.vue';
-import { ref, useTemplateRef } from 'vue';
+import { computed, ref, useTemplateRef } from 'vue';
 import { ScopeShape } from './scopeShape.ts';
 import CaptureModal from './components/CaptureModal.vue';
 
@@ -11,6 +11,10 @@ const selectedIndex = ref(ScopeShape.Square);
 const scopeAutoRotationVelocity = ref(0);
 const uploadedImages = ref([] as string[]);
 const fileInputRef = useTemplateRef('file-input');
+
+type RemovedImage = { image: string; index: number };
+const undoStack = ref<RemovedImage[]>([]);
+const canUndo = computed(() => undoStack.value.length > 0);
 
 function savedFrame(objectUrl: string) {
   saveNextFrame.value = false;
@@ -48,6 +52,26 @@ const handleUploadClick = () => {
   fileInputRef.value?.click();
 };
 
+const handleRemoveUploadedImage = (removeIndex: number) => {
+  const image = uploadedImages.value[removeIndex];
+  if (image === undefined) {
+    return;
+  }
+  undoStack.value.push({ image, index: removeIndex });
+  uploadedImages.value = uploadedImages.value.filter((_, i) => i !== removeIndex);
+};
+
+const undoLastRemoval = () => {
+  const last = undoStack.value.pop();
+  if (!last) {
+    return;
+  }
+  const next = [...uploadedImages.value];
+  const insertIndex = Math.min(Math.max(last.index, 0), next.length);
+  next.splice(insertIndex, 0, last.image);
+  uploadedImages.value = next;
+};
+
 window.addEventListener('keypress', (keyEvent) => {
   if (keyEvent.code === 'Digit1') {
     selectedIndex.value = ScopeShape.Equilateral;
@@ -66,7 +90,17 @@ window.addEventListener('keypress', (keyEvent) => {
     :uploaded-images="uploadedImages"
     @save-frame="savedFrame"
     @upload-click="handleUploadClick"
+    @remove-uploaded-image="handleRemoveUploadedImage"
   />
+
+  <button
+    v-if="canUndo"
+    type="button"
+    class="fixed left-3 top-3 z-30 rounded-full bg-black/70 text-white text-xs px-3 py-1.5 shadow-md backdrop-blur-sm hover:bg-black/85 active:scale-95 transition"
+    @click.stop="undoLastRemoval"
+  >
+    Undo
+  </button>
   <div
     v-if="!showCapture && uploadedImages.length === 0"
     class="fixed left-1/2 pointer-events-none z-10 min-w-[200px] min-h-[200px] w-[80vmin] h-[80vmin] -translate-x-1/2 -translate-y-1/2 flex items-center justify-center"
