@@ -47,15 +47,15 @@ const bottomSlotIndex = ref(0);
 const orbTransitionProgress = ref(0.0);
 const isOrbTransitioning = ref(false);
 const orbTransitionDirection = ref<1 | -1>(1);
-const orbTransitionStartTime = ref(0);
-const ORB_TRANSITION_DURATION_MS = 450;
-const orbScrollVelocity = ref(0);
-const orbScrollProgress = ref(0);
-const ORB_SCROLL_SPRING = 0.08;
-const ORB_SCROLL_DAMPING = 0.85;
-const ORB_SCROLL_IMPULSE = 0.0016;
-const ORB_SWIPE_IMPULSE = 0.012;
-const ORB_SCROLL_FAST_THRESHOLD = 0.08;
+const lastOrbInputTime = ref(0);
+const ORB_SCROLL_IDLE_MS = 40;
+const ORB_SCROLL_COMPLETE_THRESHOLD = 0.5;
+const ORB_SCROLL_SETTLE_RATE = 0.12;
+const ORB_SWIPE_IMPULSE = 0.02;
+const ORB_TRACKPAD_MULTIPLIER = 1;
+const ORB_WHEEL_MULTIPLIER = 1;
+const ORB_SCROLL_PIXEL_TO_PROGRESS = 0.001;
+const ORB_SCROLL_LINE_TO_PROGRESS = 0.08;
 const maxRotationSpeed = 0.01; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
@@ -124,15 +124,11 @@ const syncSlotIndices = () => {
 };
 
 const startOrbTransition = (direction: 1 | -1) => {
-  if (isOrbTransitioning.value) {
-    return;
-  }
   if (uploadedImageElements.value.length <= 1) {
     return;
   }
   orbTransitionDirection.value = direction;
-  orbTransitionProgress.value = 0.0;
-  orbTransitionStartTime.value = performance.now();
+  orbTransitionProgress.value = Math.max(orbTransitionProgress.value, 0.05);
   isOrbTransitioning.value = true;
 };
 
@@ -148,12 +144,60 @@ const lerp = (start: number, end: number, progress: number): number => {
   return start + (end - start) * progress;
 };
 
+const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom') => {
+  const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
+  const direction = orbTransitionDirection.value;
+  let scale = slot === 'center' ? 1 : ORB_SMALL_SCALE;
+
+  if (progress > 0) {
+    if (direction === 1) {
+      if (slot === 'center') {
+        scale = lerp(1, ORB_SMALL_SCALE, progress);
+      } else if (slot === 'bottom') {
+        scale = lerp(ORB_SMALL_SCALE, 1, progress);
+      }
+    } else {
+      if (slot === 'center') {
+        scale = lerp(1, ORB_SMALL_SCALE, progress);
+      } else if (slot === 'top') {
+        scale = lerp(ORB_SMALL_SCALE, 1, progress);
+      }
+    }
+  }
+
+  return scale;
+};
+
+const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom') => {
+  const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
+  const direction = orbTransitionDirection.value;
+  let scale = slot === 'center' ? 1 : ORB_SCOPE_SCALE_MULTIPLIER;
+
+  if (progress > 0) {
+    if (direction === 1) {
+      if (slot === 'center') {
+        scale = lerp(1, ORB_SCOPE_SCALE_MULTIPLIER, progress);
+      } else if (slot === 'bottom') {
+        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, progress);
+      }
+    } else {
+      if (slot === 'center') {
+        scale = lerp(1, ORB_SCOPE_SCALE_MULTIPLIER, progress);
+      } else if (slot === 'top') {
+        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, progress);
+      }
+    }
+  }
+
+  return scale;
+};
+
 const getOrbStyle = (slot: 'top' | 'center' | 'bottom') => {
   const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
   const direction = orbTransitionDirection.value;
 
   let topPercent = slot === 'top' ? ORB_TOP_Y : slot === 'center' ? ORB_CENTER_Y : ORB_BOTTOM_Y;
-  let scale = slot === 'center' ? 1 : ORB_SMALL_SCALE;
+  const scale = getOrbSizeScale(slot);
 
   if (progress > 0) {
     if (direction === 1) {
@@ -161,20 +205,16 @@ const getOrbStyle = (slot: 'top' | 'center' | 'bottom') => {
         topPercent = lerp(ORB_TOP_Y, ORB_OFFSCREEN_TOP, progress);
       } else if (slot === 'center') {
         topPercent = lerp(ORB_CENTER_Y, ORB_TOP_Y, progress);
-        scale = lerp(1, ORB_SMALL_SCALE, progress);
       } else {
         topPercent = lerp(ORB_BOTTOM_Y, ORB_CENTER_Y, progress);
-        scale = lerp(ORB_SMALL_SCALE, 1, progress);
       }
     } else {
       if (slot === 'bottom') {
         topPercent = lerp(ORB_BOTTOM_Y, ORB_OFFSCREEN_BOTTOM, progress);
       } else if (slot === 'center') {
         topPercent = lerp(ORB_CENTER_Y, ORB_BOTTOM_Y, progress);
-        scale = lerp(1, ORB_SMALL_SCALE, progress);
       } else {
         topPercent = lerp(ORB_TOP_Y, ORB_CENTER_Y, progress);
-        scale = lerp(ORB_SMALL_SCALE, 1, progress);
       }
     }
   }
@@ -194,8 +234,34 @@ const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
   if (!isSwipeGesture(deltaX, deltaY)) {
     return false;
   }
-  orbScrollVelocity.value += Math.max(-1, Math.min(1, deltaY / 200)) * ORB_SWIPE_IMPULSE;
+  const direction = deltaY < 0 ? 1 : -1;
+  const impulse = Math.max(-1, Math.min(1, deltaY / 200)) * ORB_SWIPE_IMPULSE;
+  lastOrbInputTime.value = performance.now();
+  if (!isOrbTransitioning.value || orbTransitionDirection.value !== direction) {
+    orbTransitionProgress.value = 0.0;
+    startOrbTransition(direction);
+  }
+  orbTransitionProgress.value = Math.min(1, orbTransitionProgress.value + Math.abs(impulse));
   return true;
+};
+
+const getReadySource = (
+  primary: HTMLImageElement | HTMLVideoElement | null,
+  fallback: HTMLImageElement | HTMLVideoElement | null
+) => {
+  if (primary instanceof HTMLImageElement) {
+    if (primary.complete && primary.naturalWidth > 0) {
+      return primary;
+    }
+    return fallback;
+  }
+  if (primary instanceof HTMLVideoElement) {
+    if (primary.readyState >= 2 && primary.videoWidth > 0) {
+      return primary;
+    }
+    return fallback;
+  }
+  return fallback;
 };
 
 const loadUploadedImages = async (imageSrcs: string[]) => {
@@ -811,6 +877,7 @@ async function main(canvasElement: HTMLCanvasElement) {
   };
 
   function animate(){
+    const now = performance.now();
     // Handle keyboard state
     if (keyPressedA.value && keyPressedD.value) {
       // Do nothing
@@ -870,9 +937,13 @@ async function main(canvasElement: HTMLCanvasElement) {
     scopeOffsetVel.value[1] *= 0.95;
 
     if (isOrbTransitioning.value) {
-      const now = performance.now();
-      const elapsed = now - orbTransitionStartTime.value;
-      orbTransitionProgress.value = Math.min(elapsed / ORB_TRANSITION_DURATION_MS, 1.0);
+      const timeSinceInput = now - lastOrbInputTime.value;
+      if (timeSinceInput > ORB_SCROLL_IDLE_MS) {
+        const targetProgress = orbTransitionProgress.value >= ORB_SCROLL_COMPLETE_THRESHOLD ? 1 : 0;
+        const progressDelta = (targetProgress - orbTransitionProgress.value) * ORB_SCROLL_SETTLE_RATE;
+        orbTransitionProgress.value += progressDelta;
+      }
+      orbTransitionProgress.value = Math.max(0, Math.min(1, orbTransitionProgress.value));
       if (orbTransitionProgress.value >= 1.0) {
         const totalImages = uploadedImageElements.value.length;
         if (totalImages > 0) {
@@ -882,34 +953,20 @@ async function main(canvasElement: HTMLCanvasElement) {
         syncSlotIndices();
         isOrbTransitioning.value = false;
         orbTransitionProgress.value = 0.0;
-        if (Math.abs(orbScrollVelocity.value) > ORB_SCROLL_FAST_THRESHOLD) {
-          startOrbTransition(orbScrollVelocity.value > 0 ? 1 : -1);
-        }
+      } else if (orbTransitionProgress.value <= 0.001) {
+        isOrbTransitioning.value = false;
+        orbTransitionProgress.value = 0.0;
       }
-    }
-
-    if (!isOrbTransitioning.value) {
-      orbScrollVelocity.value += -orbScrollProgress.value * ORB_SCROLL_SPRING;
-      orbScrollProgress.value += orbScrollVelocity.value;
-      orbScrollVelocity.value *= ORB_SCROLL_DAMPING;
-      if (Math.abs(orbScrollVelocity.value) < 0.00001) {
-        orbScrollVelocity.value = 0;
-      }
-      if (Math.abs(orbScrollProgress.value) >= 1) {
-        const direction = orbScrollProgress.value > 0 ? 1 : -1;
-        orbScrollProgress.value = 0;
-        orbScrollVelocity.value *= 0.6;
-        startOrbTransition(direction);
-      }
-    } else {
-      orbScrollVelocity.value *= ORB_SCROLL_DAMPING;
     }
 
     const hasUploadedImages = uploadedImageElements.value.length > 0;
     const topImage = hasUploadedImages ? uploadedImageElements.value[topSlotIndex.value] : null;
     const centerImage = hasUploadedImages ? uploadedImageElements.value[centerSlotIndex.value] : null;
     const bottomImage = hasUploadedImages ? uploadedImageElements.value[bottomSlotIndex.value] : null;
-    const fallbackSource = camera;
+    const cameraFallback = camera;
+    const centerSource = getReadySource(centerImage, cameraFallback);
+    const topSource = getReadySource(topImage, centerSource);
+    const bottomSource = getReadySource(bottomImage, centerSource);
 
     gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
     gl.uniform1i(scopeShapeBind, props.scopeShape);
@@ -919,9 +976,9 @@ async function main(canvasElement: HTMLCanvasElement) {
     gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
     gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
 
-    drawOrbFrame(displayCanvasTop.value ?? null, topImage ?? fallbackSource, ORB_SCOPE_SCALE_MULTIPLIER);
-    drawOrbFrame(displayCanvasBottom.value ?? null, bottomImage ?? fallbackSource, ORB_SCOPE_SCALE_MULTIPLIER);
-    drawOrbFrame(displayCanvasCenter.value ?? null, centerImage ?? fallbackSource, 1);
+    drawOrbFrame(displayCanvasTop.value ?? null, topSource ?? cameraFallback, getOrbScopeScale('top'));
+    drawOrbFrame(displayCanvasBottom.value ?? null, bottomSource ?? cameraFallback, getOrbScopeScale('bottom'));
+    drawOrbFrame(displayCanvasCenter.value ?? null, centerSource ?? cameraFallback, getOrbScopeScale('center'));
 
     if (props.saveNextFrame) {
       emit(
@@ -1142,8 +1199,18 @@ onMounted(async () => {
     if (Math.abs(wheelEvent.deltaY) < 4) {
       return;
     }
-    const clampedDelta = Math.max(-80, Math.min(80, wheelEvent.deltaY));
-    orbScrollVelocity.value += clampedDelta * ORB_SCROLL_IMPULSE;
+    const clampedDelta = Math.max(-120, Math.min(120, wheelEvent.deltaY));
+    const isTrackpad = wheelEvent.deltaMode === 0;
+    const multiplier = isTrackpad ? ORB_TRACKPAD_MULTIPLIER : ORB_WHEEL_MULTIPLIER;
+    const progressFactor = isTrackpad ? ORB_SCROLL_PIXEL_TO_PROGRESS : ORB_SCROLL_LINE_TO_PROGRESS;
+    const progressDelta = clampedDelta * progressFactor * multiplier;
+    const direction = progressDelta > 0 ? 1 : -1;
+    lastOrbInputTime.value = performance.now();
+    if (!isOrbTransitioning.value || orbTransitionDirection.value !== direction) {
+      orbTransitionProgress.value = 0.0;
+      startOrbTransition(direction);
+    }
+    orbTransitionProgress.value = Math.min(1, orbTransitionProgress.value + Math.abs(progressDelta));
   }, { passive: false });
 
   interactionElement.addEventListener('touchstart', touchStartCallback);
@@ -1244,10 +1311,13 @@ watch(() => props.uploadedImages, async (newImages) => {
 <template>
   <!-- Full-viewport wrapper so #app has height and toolbar stays at bottom -->
   <div class="w-[100dvw] h-[100dvh] relative overflow-hidden">
-    <div ref="interaction-layer" class="absolute inset-0 z-20 touch-none select-none" />
+    <div
+      ref="interaction-layer"
+      class="absolute inset-0 z-20 touch-none select-none"
+    />
     <!-- Top orb (bottom hemisphere visible) -->
     <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-0 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
       :style="getOrbStyle('top')"
       aria-hidden="true"
     >
@@ -1259,7 +1329,7 @@ watch(() => props.uploadedImages, async (newImages) => {
 
     <!-- Center orb (full) -->
     <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-10 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-10 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
       :style="getOrbStyle('center')"
     >
       <canvas
@@ -1270,7 +1340,7 @@ watch(() => props.uploadedImages, async (newImages) => {
 
     <!-- Bottom orb (top hemisphere visible) -->
     <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-[#EAEAE8] z-0 w-[80vmin] h-[80vmin] min-w-[200px] min-h-[200px]"
+      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
       :style="getOrbStyle('bottom')"
       aria-hidden="true"
     >
