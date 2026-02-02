@@ -47,11 +47,7 @@ const bottomSlotIndex = ref(0);
 const orbTransitionProgress = ref(0.0);
 const isOrbTransitioning = ref(false);
 const orbTransitionDirection = ref<1 | -1>(1);
-const lastOrbInputTime = ref(0);
-const ORB_SCROLL_IDLE_MS = 40;
-const ORB_SCROLL_COMPLETE_THRESHOLD = 0.5;
-const ORB_SCROLL_SETTLE_RATE = 0.12;
-const ORB_SWIPE_IMPULSE = 0.02;
+const orbScrollOffset = ref(0);
 const ORB_TRACKPAD_MULTIPLIER = 1;
 const ORB_WHEEL_MULTIPLIER = 1;
 const ORB_SCROLL_PIXEL_TO_PROGRESS = 0.001;
@@ -123,13 +119,24 @@ const syncSlotIndices = () => {
   bottomSlotIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
 };
 
-const startOrbTransition = (direction: 1 | -1) => {
-  if (uploadedImageElements.value.length <= 1) {
+const applyOrbScrollDelta = (delta: number) => {
+  const totalImages = uploadedImageElements.value.length;
+  if (totalImages <= 1) {
     return;
   }
-  orbTransitionDirection.value = direction;
-  orbTransitionProgress.value = Math.max(orbTransitionProgress.value, 0.05);
-  isOrbTransitioning.value = true;
+  orbScrollOffset.value += delta;
+  while (orbScrollOffset.value >= 1) {
+    activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
+    orbScrollOffset.value -= 1;
+  }
+  while (orbScrollOffset.value <= -1) {
+    activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
+    orbScrollOffset.value += 1;
+  }
+  syncSlotIndices();
+  orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
+  orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
+  isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
 };
 
 const ORB_SMALL_SCALE = 0.5;
@@ -234,14 +241,8 @@ const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
   if (!isSwipeGesture(deltaX, deltaY)) {
     return false;
   }
-  const direction = deltaY < 0 ? 1 : -1;
-  const impulse = Math.max(-1, Math.min(1, deltaY / 200)) * ORB_SWIPE_IMPULSE;
-  lastOrbInputTime.value = performance.now();
-  if (!isOrbTransitioning.value || orbTransitionDirection.value !== direction) {
-    orbTransitionProgress.value = 0.0;
-    startOrbTransition(direction);
-  }
-  orbTransitionProgress.value = Math.min(1, orbTransitionProgress.value + Math.abs(impulse));
+  const progressDelta = Math.max(-1, Math.min(1, -deltaY / 200));
+  applyOrbScrollDelta(progressDelta);
   return true;
 };
 
@@ -281,6 +282,7 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
     }
     uploadedImageElements.value = loadedImages;
     activeImageIndex.value = 0;
+    orbScrollOffset.value = 0;
     syncSlotIndices();
     orbTransitionProgress.value = 0.0;
     isOrbTransitioning.value = false;
@@ -294,6 +296,7 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
   } else {
     uploadedImageElements.value = [];
     activeImageIndex.value = 0;
+    orbScrollOffset.value = 0;
     syncSlotIndices();
     orbTransitionProgress.value = 0.0;
     isOrbTransitioning.value = false;
@@ -877,7 +880,6 @@ async function main(canvasElement: HTMLCanvasElement) {
   };
 
   function animate(){
-    const now = performance.now();
     // Handle keyboard state
     if (keyPressedA.value && keyPressedD.value) {
       // Do nothing
@@ -936,27 +938,9 @@ async function main(canvasElement: HTMLCanvasElement) {
     scopeOffsetVel.value[0] *= 0.95;
     scopeOffsetVel.value[1] *= 0.95;
 
-    if (isOrbTransitioning.value) {
-      const timeSinceInput = now - lastOrbInputTime.value;
-      if (timeSinceInput > ORB_SCROLL_IDLE_MS) {
-        const targetProgress = orbTransitionProgress.value >= ORB_SCROLL_COMPLETE_THRESHOLD ? 1 : 0;
-        const progressDelta = (targetProgress - orbTransitionProgress.value) * ORB_SCROLL_SETTLE_RATE;
-        orbTransitionProgress.value += progressDelta;
-      }
-      orbTransitionProgress.value = Math.max(0, Math.min(1, orbTransitionProgress.value));
-      if (orbTransitionProgress.value >= 1.0) {
-        const totalImages = uploadedImageElements.value.length;
-        if (totalImages > 0) {
-          const delta = orbTransitionDirection.value === 1 ? 1 : -1;
-          activeImageIndex.value = getWrappedIndex(activeImageIndex.value + delta, totalImages);
-        }
-        syncSlotIndices();
-        isOrbTransitioning.value = false;
-        orbTransitionProgress.value = 0.0;
-      } else if (orbTransitionProgress.value <= 0.001) {
-        isOrbTransitioning.value = false;
-        orbTransitionProgress.value = 0.0;
-      }
+    if (orbTransitionProgress.value <= 0.001) {
+      isOrbTransitioning.value = false;
+      orbTransitionProgress.value = 0.0;
     }
 
     const hasUploadedImages = uploadedImageElements.value.length > 0;
@@ -1204,13 +1188,7 @@ onMounted(async () => {
     const multiplier = isTrackpad ? ORB_TRACKPAD_MULTIPLIER : ORB_WHEEL_MULTIPLIER;
     const progressFactor = isTrackpad ? ORB_SCROLL_PIXEL_TO_PROGRESS : ORB_SCROLL_LINE_TO_PROGRESS;
     const progressDelta = clampedDelta * progressFactor * multiplier;
-    const direction = progressDelta > 0 ? 1 : -1;
-    lastOrbInputTime.value = performance.now();
-    if (!isOrbTransitioning.value || orbTransitionDirection.value !== direction) {
-      orbTransitionProgress.value = 0.0;
-      startOrbTransition(direction);
-    }
-    orbTransitionProgress.value = Math.min(1, orbTransitionProgress.value + Math.abs(progressDelta));
+    applyOrbScrollDelta(progressDelta);
   }, { passive: false });
 
   interactionElement.addEventListener('touchstart', touchStartCallback);
@@ -1281,6 +1259,7 @@ watch(() => props.uploadedImages, async (newImages) => {
   } else {
     uploadedImageElements.value = [];
     activeImageIndex.value = 0;
+    orbScrollOffset.value = 0;
     syncSlotIndices();
     orbTransitionProgress.value = 0.0;
     isOrbTransitioning.value = false;
