@@ -54,11 +54,11 @@ const orbTransitionProgress = ref(0.0);
 const isOrbTransitioning = ref(false);
 const orbTransitionDirection = ref<1 | -1>(1);
 const orbScrollOffset = ref(0);
-const ORB_TRACKPAD_MULTIPLIER = 1;
-const ORB_WHEEL_MULTIPLIER = 1;
-const ORB_SCROLL_PIXEL_TO_PROGRESS = 0.001;
+const ORB_TRACKPAD_MULTIPLIER = 3;
+const ORB_WHEEL_MULTIPLIER = 3;
+const ORB_SCROLL_PIXEL_TO_PROGRESS = 0.002;
 const ORB_SCROLL_LINE_TO_PROGRESS = 0.08;
-const maxRotationSpeed = 0.01; // Maximum rotation velocity
+const maxRotationSpeed = 0.05; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
 
@@ -148,6 +148,7 @@ const applyOrbScrollDelta = (delta: number) => {
 // Scroll snapping: animate orbScrollOffset to nearest integer when user stops scrolling
 let orbSnapTimeout: number | null = null;
 let orbSnapRaf: number | null = null;
+let orbLastWheelDelta = 0;
 const cancelOrbSnap = () => {
   if (orbSnapTimeout !== null) {
     clearTimeout(orbSnapTimeout);
@@ -158,63 +159,73 @@ const cancelOrbSnap = () => {
     orbSnapRaf = null;
   }
 };
+const ORB_FAST_SCROLL_THRESHOLD = 1.0; // progress delta threshold considered a "fast" flick
 const startOrbSnap = () => {
   cancelOrbSnap();
+
+  // Normalize orbScrollOffset into (-1,1) by applying any full-step offsets immediately.
   const totalImages = uploadedImageElements.value.length;
-  // Nothing to snap if there's one or no images
-  if (totalImages <= 1) return;
+  while (orbScrollOffset.value >= 1) {
+    if (totalImages > 0) {
+      activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
+    }
+    orbScrollOffset.value -= 1;
+  }
+  while (orbScrollOffset.value <= -1) {
+    if (totalImages > 0) {
+      activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
+    }
+    orbScrollOffset.value += 1;
+  }
+  syncSlotIndices();
+
   const start = orbScrollOffset.value;
-  const target = Math.round(start);
-  if (start === target) return;
+  // If the last wheel flick was a fast downward flick, snap to center (0)
+  const shouldSnapToCenter = orbLastWheelDelta < -ORB_FAST_SCROLL_THRESHOLD;
+  const target = shouldSnapToCenter ? 0 : Math.round(start);
+  if (start === target) {
+    // No animation needed
+    orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
+    orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
+    isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
+    return;
+  }
 
-  // Spring parameters (tweakable)
-  const stiffness = 220; // spring stiffness
-  const damping = 26; // damping coefficient
-
-  let pos = start;
-  let vel = 0;
-  let lastTime = performance.now();
-
-  const step = (now: number) => {
-    const dt = Math.min(0.032, (now - lastTime) / 1000); // cap dt for stability
-    lastTime = now;
-
-    // Hooke's law + damping: a = -k * x - c * v
-    const x = pos - target;
-    const acc = -stiffness * x - damping * vel;
-    vel += acc * dt;
-    pos += vel * dt;
-
-    orbScrollOffset.value = pos;
+  const duration = 200; // ms
+  const ease = (t: number) => 1 - Math.pow(1 - t, 3); // easeOutCubic
+  const t0 = performance.now();
+  orbSnapRaf = requestAnimationFrame(function step(now) {
+    const elapsed = Math.max(0, now - t0);
+    const p = Math.min(1, elapsed / duration);
+    const eased = ease(p);
+    orbScrollOffset.value = lerp(start, target, eased);
     orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
     orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
     isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
 
-    // Stop condition: close to target and very low velocity
-    if (Math.abs(pos - target) < 0.002 && Math.abs(vel) < 0.002) {
-      // Snap to exact target and finalize index wrap
-      orbScrollOffset.value = target;
-      const total = uploadedImageElements.value.length;
-      while (orbScrollOffset.value >= 1) {
-        activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, total);
-        orbScrollOffset.value -= 1;
+    if (p < 1) {
+      orbSnapRaf = requestAnimationFrame(step);
+    } else {
+      // Finalize: if target is a full step, advance the active image and reset offset
+      if (target === 1) {
+        if (totalImages > 0) {
+          activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
+        }
+        orbScrollOffset.value = 0;
+      } else if (target === -1) {
+        if (totalImages > 0) {
+          activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
+        }
+        orbScrollOffset.value = 0;
+      } else {
+        orbScrollOffset.value = 0;
       }
-      while (orbScrollOffset.value <= -1) {
-        activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, total);
-        orbScrollOffset.value += 1;
-      }
-      orbTransitionDirection.value = 1;
+      syncSlotIndices();
       orbTransitionProgress.value = 0;
       isOrbTransitioning.value = false;
-      syncSlotIndices();
       orbSnapRaf = null;
-      return;
     }
-
-    orbSnapRaf = requestAnimationFrame(step);
-  };
-
-  orbSnapRaf = requestAnimationFrame(step);
+  });
 };
 
 const ORB_SMALL_SCALE = 0.5;
@@ -229,70 +240,15 @@ const lerp = (start: number, end: number, progress: number): number => {
   return start + (end - start) * progress;
 };
 
-// Easing helpers
-const easeInCubic = (t: number) => {
-  return t * t * t;
+// All orbs use the small size and small scope.
+const getOrbSizeScale = (_slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  void _slot;
+  return ORB_SMALL_SCALE;
 };
 
-const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
-  const direction = orbTransitionDirection.value;
-  let scale = slot === 'center' ? 1 : ORB_SMALL_SCALE;
-
-  if (progress > 0) {
-    if (direction === 1) {
-      if (slot === 'center') {
-        scale = lerp(1, ORB_SMALL_SCALE, progress);
-      } else if (slot === 'bottom') {
-        // Ease growth as the orb approaches center so it feels smooth and accelerates toward the end
-        scale = lerp(ORB_SMALL_SCALE, 1, easeInCubic(progress));
-      } else if (slot === 'incoming') {
-        // incoming moves into the small orb slot; keep small scale
-        scale = ORB_SMALL_SCALE;
-      }
-    } else {
-      if (slot === 'center') {
-        scale = lerp(1, ORB_SMALL_SCALE, progress);
-      } else if (slot === 'top') {
-        // Ease growth as the orb approaches center
-        scale = lerp(ORB_SMALL_SCALE, 1, easeInCubic(progress));
-      } else if (slot === 'incoming') {
-        scale = ORB_SMALL_SCALE;
-      }
-    }
-  }
-
-  return scale;
-};
-
-const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
-  const direction = orbTransitionDirection.value;
-  let scale = slot === 'center' ? 1 : ORB_SCOPE_SCALE_MULTIPLIER;
-
-  if (progress > 0) {
-    if (direction === 1) {
-      if (slot === 'center') {
-        scale = lerp(1, ORB_SCOPE_SCALE_MULTIPLIER, progress);
-      } else if (slot === 'bottom') {
-        // Ease scope growth as orb approaches center for smoother feeling
-        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, easeInCubic(progress));
-      } else if (slot === 'incoming') {
-        scale = ORB_SCOPE_SCALE_MULTIPLIER;
-      }
-    } else {
-      if (slot === 'center') {
-        scale = lerp(1, ORB_SCOPE_SCALE_MULTIPLIER, progress);
-      } else if (slot === 'top') {
-        // Ease scope growth as orb approaches center
-        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, easeInCubic(progress));
-      } else if (slot === 'incoming') {
-        scale = ORB_SCOPE_SCALE_MULTIPLIER;
-      }
-    }
-  }
-
-  return scale;
+const getOrbScopeScale = (_slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  void _slot;
+  return ORB_SCOPE_SCALE_MULTIPLIER;
 };
 
 const getOrbStyle = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
@@ -347,7 +303,7 @@ const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
   if (!isSwipeGesture(deltaX, deltaY)) {
     return false;
   }
-  const progressDelta = Math.max(-1, Math.min(1, -deltaY / 200));
+  const progressDelta = Math.max(-1, Math.min(1, -deltaY / 100));
   applyOrbScrollDelta(progressDelta);
   return true;
 };
@@ -1330,6 +1286,12 @@ onMounted(async () => {
     const multiplier = isTrackpad ? ORB_TRACKPAD_MULTIPLIER : ORB_WHEEL_MULTIPLIER;
     const progressFactor = isTrackpad ? ORB_SCROLL_PIXEL_TO_PROGRESS : ORB_SCROLL_LINE_TO_PROGRESS;
     const progressDelta = clampedDelta * progressFactor * multiplier;
+    // Track last wheel delta to detect fast flicks
+    try {
+      orbLastWheelDelta = progressDelta;
+    } catch {
+      // silent
+    }
     applyOrbScrollDelta(progressDelta);
     // Snap after a short pause in wheel activity
     if (orbSnapTimeout !== null) {
