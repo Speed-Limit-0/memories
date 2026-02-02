@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, onMounted, nextTick, useTemplateRef, watch} from 'vue';
+import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
@@ -68,6 +68,11 @@ const ORB_MAX_VELOCITY = 20;
 const maxRotationSpeed = 1; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
+// Scroll -> rotation mapping: scale factor applied to scroll velocity (px/ms) to rotation velocity
+const SCROLL_ROTATION_SCALE = 0.02;
+// Track last window scroll position/time to compute scroll velocity
+let lastWindowScrollY = 0;
+let lastWindowScrollTime = performance.now();
 
 // Horizontal drag-to-dismiss (removes the active uploaded image)
 const ORB_DISMISS_DURATION_MS = 200;
@@ -76,10 +81,13 @@ const orbDragTranslateY = ref(0);
 const orbDragScaleMultiplier = ref(1);
 const isOrbDragging = ref(false);
 const isOrbDismissing = ref(false);
+const isCenterHiddenDuringDismiss = ref(false);
+const orbFillAnimating = ref(false);
 let orbDragMouseStart: null | { x: number; y: number } = null;
 let orbDragMouseActive = false;
 let orbDragTouchActive = false;
 let orbDragTouchLast: null | Point = null;
+let orbDragLastX: null | number = null;
 const pendingOrbRemovalIndex = ref<number | null>(null);
 
 const clampRotationVelocity = (velocity: number): number => {
@@ -384,6 +392,16 @@ const getOrbStyle = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
     top: `${topPercent}%`,
     transform: `translate(-50%, -50%) translate(${extraTranslateX}px, ${extraTranslateY}px) scale(${scale * extraScale})`,
   };
+};
+
+// Center orb style wrapper so we can hide it during dismiss animations
+const getCenterOrbStyle = (): Record<string, string> => {
+  const s = getOrbStyle('center') as Record<string, string>;
+  if (isCenterHiddenDuringDismiss.value) {
+    s.opacity = '0';
+    s.pointerEvents = 'none';
+  }
+  return s;
 };
 
 const SWIPE_DISTANCE_PX = 60;
@@ -769,10 +787,8 @@ async function main(canvasElement: HTMLCanvasElement) {
           vec2 texCoordG = clamp(vec2(iG.x, iG.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
           vec2 texCoordB = clamp(vec2(iB.x, iB.y) / vec2(dataDimensions.x, dataDimensions.y), 0.0, 1.0);
           
-          // Motion blur based on rotation velocity - apply in texture coordinate space
-          // Only apply motion blur when rotation is significant to save performance
-          float motionBlurStrength = abs(rotationVelocity) * 8.0; // Increased multiplier for visibility
-          motionBlurStrength = min(motionBlurStrength, 1.2); // Cap maximum blur
+          // Motion blur disabled: remove spin blur on kaleidoscope rotation
+          float motionBlurStrength = 0.0;
           
           vec3 color1R, color1G, color1B;
           float a1;
@@ -1043,8 +1059,8 @@ const ORB_INDEX_CHANGE_MIN_MS = 80;
     const dt = Math.min(0.032, (now - lastAnimateTime) / 1000);
     lastAnimateTime = now;
 
-    // Integrate orb scroll physics
-    if (Math.abs(orbScrollVel.value) > 0) {
+    // Integrate orb scroll physics (skip while fill animation is running)
+    if (!orbFillAnimating.value && Math.abs(orbScrollVel.value) > 0) {
       orbScrollOffset.value += orbScrollVel.value * dt;
       // Apply exponential friction for frame-rate independence
       orbScrollVel.value *= Math.exp(-ORB_FRICTION * dt);
@@ -1076,7 +1092,7 @@ const ORB_INDEX_CHANGE_MIN_MS = 80;
       orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
       orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
       isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
-    } else {
+    } else if (!orbFillAnimating.value) {
       // If velocity is zero and user isn't interacting, optionally start snap to nearest
       if (!isUserPressing.value && Math.abs(orbScrollOffset.value - Math.round(orbScrollOffset.value)) > 0.001 && orbSnapRaf === null) {
         // startOrbSnap will handle small spring settling
@@ -1235,6 +1251,131 @@ function touchDistance(t1: Touch, t2: Touch): number {
   return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
 }
 
+// Helper: determine if a point/event is inside the center orb element
+type PointLike = { clientX?: number; clientY?: number; x?: number; y?: number };
+const isPointInsideCenterOrb = (p: PointLike | Touch | MouseEvent): boolean => {
+  const obj = p as PointLike;
+  let clientX = 0;
+  let clientY = 0;
+  if (typeof obj.clientX === 'number') {
+    clientX = obj.clientX;
+  } else if (typeof obj.x === 'number') {
+    clientX = obj.x;
+  }
+  if (typeof obj.clientY === 'number') {
+    clientY = obj.clientY;
+  } else if (typeof obj.y === 'number') {
+    clientY = obj.y;
+  }
+  const el = centerOrb.value as HTMLDivElement | undefined;
+  if (!el) return false;
+  const rect = el.getBoundingClientRect();
+  const dx = clientX - (rect.left + rect.width / 2);
+  const dy = clientY - (rect.top + rect.height / 2);
+  return Math.hypot(dx, dy) <= Math.min(rect.width, rect.height) / 2;
+};
+
+// Reset drag visuals for center orb
+const resetOrbDragVisuals = () => {
+  orbDragTranslateX.value = 0;
+  orbDragTranslateY.value = 0;
+  orbDragScaleMultiplier.value = 1;
+  isOrbDragging.value = false;
+  isOrbDismissing.value = false;
+  pendingOrbRemovalIndex.value = null;
+  orbDragLastX = null;
+};
+
+// Set drag visuals while dragging
+const setOrbDragVisuals = (deltaX: number) => {
+  orbDragTranslateX.value = deltaX;
+  orbDragTranslateY.value = 0;
+  // modest scale down while dragging
+  orbDragScaleMultiplier.value = Math.max(0.85, 1 - Math.abs(deltaX) / 1000);
+};
+
+const getCenterOrbDismissThresholdPx = (): number => {
+  return Math.max(60, Math.round(Math.min(window.innerWidth, window.innerHeight) * 0.15));
+};
+
+const dismissActiveOrb = async (direction: 1 | -1, removeIndex: number) => {
+  if (uploadedImageElements.value.length === 0) return;
+  isOrbDismissing.value = true;
+  pendingOrbRemovalIndex.value = removeIndex;
+  // animate by setting translate and scale
+  orbDragTranslateX.value = direction * (getCenterOrbDismissThresholdPx() + 20);
+  orbDragScaleMultiplier.value = 0.85;
+  // First, wait for the horizontal dismiss visual to complete (center orb moves offscreen).
+  await new Promise<void>(resolve => setTimeout(() => resolve(), ORB_DISMISS_DURATION_MS));
+
+  // Hide the center DOM so it does not immediately reappear with a different photo.
+  isCenterHiddenDuringDismiss.value = true;
+
+  // Prevent any ongoing scroll physics/snapping from interfering with the fill animation.
+  orbScrollVel.value = 0;
+  cancelOrbSnap();
+  // Animate the vertical orb-stack fill (other orbs move into center). This is strictly vertical.
+  await animateOrbStackFill(direction, ORB_DISMISS_DURATION_MS);
+
+  // Perform local removal so UI updates after the fill animation completes.
+  removeUploadedImageAtIndex(removeIndex);
+  // Notify parent about removal (watch handler will detect pending removal and avoid double-removal).
+  emit('remove-uploaded-image', removeIndex);
+
+  // Reveal center orb now that the vertical fill animation and local removal completed.
+  isCenterHiddenDuringDismiss.value = false;
+
+  // cleanup
+  isOrbDismissing.value = false;
+  resetOrbDragVisuals();
+};
+
+// Animate the orb stack so top/center/bottom visually shift to fill a removed center orb.
+// direction: 1 => bottom moves into center (scroll up), -1 => top moves into center (scroll down)
+const animateOrbStackFill = (direction: 1 | -1, durationMs: number) => {
+  return new Promise<void>((resolve) => {
+    const start = performance.now();
+    const from = 0;
+    const to = direction;
+    // easing
+    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+
+    isOrbTransitioning.value = true;
+    orbTransitionDirection.value = direction;
+    orbFillAnimating.value = true;
+
+    const step = (now: number) => {
+      const elapsed = Math.min(durationMs, now - start);
+      const t = durationMs > 0 ? elapsed / durationMs : 1;
+      const eased = easeOutCubic(t);
+      orbScrollOffset.value = lerp(from, to, eased);
+      orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
+      orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
+
+      if (elapsed >= durationMs) {
+        // finish animation
+        orbScrollOffset.value = 0; // reset offset; actual new center will be set by local removal & syncSlotIndices
+        orbTransitionProgress.value = 0;
+        isOrbTransitioning.value = false;
+        orbFillAnimating.value = false;
+        resolve();
+        return;
+      }
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+};
+
+const removeUploadedImageAtIndex = (index: number) => {
+  if (index < 0 || index >= uploadedImageElements.value.length) return;
+  uploadedImageElements.value.splice(index, 1);
+  if (activeImageIndex.value >= uploadedImageElements.value.length) {
+    activeImageIndex.value = Math.max(0, uploadedImageElements.value.length - 1);
+  }
+  syncSlotIndices();
+};
+
 function touchStartCallback(event: TouchEvent) {
   event.preventDefault();
   const len = event.touches.length;
@@ -1261,6 +1402,7 @@ function touchStartCallback(event: TouchEvent) {
     ) {
       orbDragTouchActive = true;
       orbDragTouchLast = touch;
+      orbDragLastX = touch.clientX;
       isOrbDragging.value = true;
     } else {
       orbDragTouchActive = false;
@@ -1294,8 +1436,18 @@ function touchMoveCallback(event: TouchEvent) {
       return;
     }
     if (orbDragTouchActive) {
+      // Rotate kaleidoscope incrementally based on horizontal drag delta
+      const now = performance.now();
+      const prevX = orbDragLastX ?? touch.clientX;
+      const dx = touch.clientX - prevX;
+      const dt = Math.max(1, now - touchPrevTime);
+      // Sensitivity tuned for pleasant feel
+      scopeRotation.value += dx / 300;
+      scopeRotationVel.value = clampRotationVelocity((dx / dt) * 0.02);
+      orbDragLastX = touch.clientX;
       orbDragTouchLast = touch;
       setOrbDragVisuals(touch.clientX - touchOrigin1.clientX);
+      touchPrevTime = now;
       return;
     }
     if (new Date().getTime() - touchPrevTime < 0.001) {
@@ -1422,6 +1574,7 @@ onMounted(async () => {
     if (shouldOrbDrag) {
       orbDragMouseActive = true;
       orbDragMouseStart = pos;
+      orbDragLastX = pos.x;
       isOrbDragging.value = true;
       mousePrevPosition = null;
       mouseStartPosition = null;
@@ -1439,7 +1592,16 @@ onMounted(async () => {
   let mousePrevTime = performance.now();
   document.addEventListener('mousemove', (mouseEvent) => {
     if (orbDragMouseActive && orbDragMouseStart !== null) {
+      // Rotate kaleidoscope incrementally based on horizontal drag delta
+      const now = performance.now();
+      const prevX = orbDragLastX ?? mouseEvent.clientX;
+      const dx = mouseEvent.clientX - prevX;
+      const dt = Math.max(1, now - mousePrevTime);
+      scopeRotation.value += dx / 300;
+      scopeRotationVel.value = clampRotationVelocity((dx / dt) * 0.02);
+      orbDragLastX = mouseEvent.clientX;
       setOrbDragVisuals(mouseEvent.clientX - orbDragMouseStart.x);
+      mousePrevTime = now;
       return;
     }
     if (mousePrevPosition === null) {
@@ -1585,6 +1747,23 @@ onMounted(async () => {
       keyPressedAlt.value = false;
     }
   });
+  // Scroll-based rotation: map page scroll velocity to kaleidoscope spin
+  lastWindowScrollY = window.scrollY;
+  lastWindowScrollTime = performance.now();
+  const onWindowScroll = () => {
+    const now = performance.now();
+    const dy = window.scrollY - lastWindowScrollY;
+    const dt = Math.max(1, now - lastWindowScrollTime); // ms
+    // dy/dt = px per ms; scale to a gentle rotation velocity impulse
+    const velocityImpulse = (dy / dt) * SCROLL_ROTATION_SCALE;
+    scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value + velocityImpulse);
+    lastWindowScrollY = window.scrollY;
+    lastWindowScrollTime = now;
+  };
+  window.addEventListener('scroll', onWindowScroll, { passive: true });
+  onUnmounted(() => {
+    window.removeEventListener('scroll', onWindowScroll);
+  });
 });
 
 // Watch for changes to uploaded images
@@ -1687,8 +1866,9 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
 
     <!-- Center orb (full) -->
     <div
+      ref="center-orb"
       class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-10 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
-      :style="getOrbStyle('center')"
+      :style="getCenterOrbStyle()"
     >
       <canvas
         ref="display-canvas-center"
