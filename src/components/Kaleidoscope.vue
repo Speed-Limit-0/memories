@@ -54,11 +54,17 @@ const orbTransitionProgress = ref(0.0);
 const isOrbTransitioning = ref(false);
 const orbTransitionDirection = ref<1 | -1>(1);
 const orbScrollOffset = ref(0);
-const ORB_TRACKPAD_MULTIPLIER = 3;
-const ORB_WHEEL_MULTIPLIER = 3;
-const ORB_SCROLL_PIXEL_TO_PROGRESS = 0.002;
-const ORB_SCROLL_LINE_TO_PROGRESS = 0.08;
-const maxRotationSpeed = 0.05; // Maximum rotation velocity
+const orbScrollVel = ref(0);
+// Simplified impulse mapping (no separate multipliers)
+// Simplified impulse mapping parameters (single mapping for wheel/trackpad/touch)
+const ORB_WHEEL_DELTA_MAX = 120; // clamp reference for raw wheel delta
+const ORB_MAX_IMPULSE = 3.0; // max impulse (progress units) for strongest flick
+const ORB_IMPULSE_EXP = 1.2; // nonlinear exponent (>1 makes large deltas grow faster)
+const ORB_TRACKPAD_SCALE = 0.9; // slight device scale for trackpad
+const ORB_FRICTION = 10; // lower = less friction (was 8)
+const ORB_VELOCITY_THRESHOLD = 1.2;
+const ORB_MAX_VELOCITY = 20;
+const maxRotationSpeed = 1; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
 
@@ -125,24 +131,33 @@ const syncSlotIndices = () => {
   bottomSlotIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
 };
 
+// Apply an impulse to scroll velocity (delta is in "progress" units)
 const applyOrbScrollDelta = (delta: number) => {
   const totalImages = uploadedImageElements.value.length;
   if (totalImages <= 1) {
     return;
   }
-  orbScrollOffset.value += delta;
-  while (orbScrollOffset.value >= 1) {
-    activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
-    orbScrollOffset.value -= 1;
-  }
-  while (orbScrollOffset.value <= -1) {
-    activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
-    orbScrollOffset.value += 1;
-  }
-  syncSlotIndices();
+  // Cancel any active snap while user is providing input
+  cancelOrbSnap();
+  // delta here is expected to already be a computed impulse value
+  orbScrollVel.value += delta;
+  // Clamp velocity to avoid runaway
+  orbScrollVel.value = Math.max(-ORB_MAX_VELOCITY, Math.min(ORB_MAX_VELOCITY, orbScrollVel.value));
+  // Ensure visuals update
   orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
   orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
   isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
+};
+
+// Convert raw input delta (wheel delta or touch delta) into a sensible impulse.
+const computeImpulseFromDelta = (rawDelta: number, isTrackpad: boolean) => {
+  const sign = Math.sign(rawDelta) || 1;
+  const absClamped = Math.min(ORB_WHEEL_DELTA_MAX, Math.abs(rawDelta));
+  const normalized = absClamped / ORB_WHEEL_DELTA_MAX; // 0..1
+  const scaled = Math.pow(normalized, ORB_IMPULSE_EXP);
+  const base = scaled * ORB_MAX_IMPULSE;
+  const deviceScale = isTrackpad ? ORB_TRACKPAD_SCALE : 1;
+  return sign * base * deviceScale;
 };
 
 // Scroll snapping: animate orbScrollOffset to nearest integer when user stops scrolling
@@ -188,44 +203,78 @@ const startOrbSnap = () => {
     orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
     orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
     isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
+    // Ensure the center orb inherits rotation from the orb that is moving into center
+    const settleDirection = start >= 0 ? 1 : -1;
+    if (settleDirection === 1) {
+      // Scrolling "up" -> bottom orb becomes center
+      scopeRotation.value = scopeRotationBottom.value;
+      scopeRotationVel.value = scopeRotationBottomVel.value;
+    } else {
+      // Scrolling "down" -> top orb becomes center
+      scopeRotation.value = scopeRotationTop.value;
+      scopeRotationVel.value = scopeRotationTopVel.value;
+    }
     return;
   }
+  // Spring parameters (tweakable)
+  const stiffness = 160; // spring stiffness (higher = stiffer)
+  const damping = 50; // damping coefficient (higher = more damped / less bouncy)
 
-  const duration = 200; // ms
-  const ease = (t: number) => 1 - Math.pow(1 - t, 3); // easeOutCubic
-  const t0 = performance.now();
-  orbSnapRaf = requestAnimationFrame(function step(now) {
-    const elapsed = Math.max(0, now - t0);
-    const p = Math.min(1, elapsed / duration);
-    const eased = ease(p);
-    orbScrollOffset.value = lerp(start, target, eased);
+  let pos = start;
+  let vel = 0;
+  let lastTime = performance.now();
+
+  const step = (now: number) => {
+    const dt = Math.min(0.032, (now - lastTime) / 1000); // cap dt for stability
+    lastTime = now;
+
+    // Hooke's law + damping: a = -k * x - c * v
+    const x = pos - target;
+    const acc = -stiffness * x - damping * vel;
+    vel += acc * dt;
+    pos += vel * dt;
+
+    orbScrollOffset.value = pos;
     orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
     orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
     isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
 
-    if (p < 1) {
-      orbSnapRaf = requestAnimationFrame(step);
-    } else {
-      // Finalize: if target is a full step, advance the active image and reset offset
-      if (target === 1) {
-        if (totalImages > 0) {
-          activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
-        }
-        orbScrollOffset.value = 0;
-      } else if (target === -1) {
-        if (totalImages > 0) {
-          activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
-        }
-        orbScrollOffset.value = 0;
-      } else {
-        orbScrollOffset.value = 0;
+    // Stop condition: close to target and very low velocity
+    if (Math.abs(pos - target) < 0.002 && Math.abs(vel) < 0.002) {
+      // Snap to exact target and finalize index wrap
+      orbScrollOffset.value = target;
+      const total = uploadedImageElements.value.length;
+      while (orbScrollOffset.value >= 1) {
+        activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, total);
+        orbScrollOffset.value -= 1;
       }
-      syncSlotIndices();
+      while (orbScrollOffset.value <= -1) {
+        activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, total);
+        orbScrollOffset.value += 1;
+      }
+      // Transfer rotation from the orb that moved into center for visual continuity
+      const settleDirection = start >= 0 ? 1 : -1;
+      if (settleDirection === 1) {
+        // Scrolling "up" -> bottom orb becomes center
+        scopeRotation.value = scopeRotationBottom.value;
+        scopeRotationVel.value = scopeRotationBottomVel.value;
+      } else {
+        // Scrolling "down" -> top orb becomes center
+        scopeRotation.value = scopeRotationTop.value;
+        scopeRotationVel.value = scopeRotationTopVel.value;
+      }
+      orbTransitionDirection.value = 1;
       orbTransitionProgress.value = 0;
       isOrbTransitioning.value = false;
+      syncSlotIndices();
       orbSnapRaf = null;
+      return;
     }
-  });
+
+    orbSnapRaf = requestAnimationFrame(step);
+  };
+
+  orbSnapRaf = requestAnimationFrame(step);
 };
 
 const ORB_SMALL_SCALE = 0.5;
@@ -240,15 +289,39 @@ const lerp = (start: number, end: number, progress: number): number => {
   return start + (end - start) * progress;
 };
 
-// All orbs use the small size and small scope.
-const getOrbSizeScale = (_slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  void _slot;
-  return ORB_SMALL_SCALE;
+// Compute orb visual and shader scope scale so the "snapped" orb grows up to 2x.
+// Weight mapping: center has weight 1 when fully centered; during transitions the
+// weight shifts to the incoming/target slot according to orbScrollOffset progress.
+const computeOrbWeight = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
+  const direction = orbScrollOffset.value >= 0 ? 1 : -1;
+
+  if (slot === 'center') {
+    return 1 - progress;
+  }
+  if (slot === 'bottom') {
+    return direction === 1 ? progress : 0;
+  }
+  if (slot === 'top') {
+    return direction === -1 ? progress : 0;
+  }
+  // incoming is an offscreen helper orb and should not scale as the snapped orb.
+  if (slot === 'incoming') {
+    return 0;
+  }
+  return 0;
 };
 
-const getOrbScopeScale = (_slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  void _slot;
-  return ORB_SCOPE_SCALE_MULTIPLIER;
+const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  const weight = computeOrbWeight(slot);
+  // Base visual size multiplied by (1 + weight). weight=1 -> 2x, weight=0 -> 1x.
+  return ORB_SMALL_SCALE * (1 + weight);
+};
+
+const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  const weight = computeOrbWeight(slot);
+  // Animate shader scope size in sync with visual orb scaling.
+  return ORB_SCOPE_SCALE_MULTIPLIER * (1 + weight);
 };
 
 const getOrbStyle = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
@@ -303,7 +376,8 @@ const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
   if (!isSwipeGesture(deltaX, deltaY)) {
     return false;
   }
-  const progressDelta = Math.max(-1, Math.min(1, -deltaY / 100));
+  // Map swipe distance to impulse (treat as touch, not trackpad)
+  const progressDelta = computeImpulseFromDelta(-deltaY, false);
   applyOrbScrollDelta(progressDelta);
   return true;
 };
@@ -941,7 +1015,56 @@ async function main(canvasElement: HTMLCanvasElement) {
     renderToDisplayCanvas(displayCanvas, canvasElement);
   };
 
+  let lastAnimateTime = performance.now();
+// Throttle rapid index changes so interrupting a snap doesn't cycle images wildly
+let lastOrbIndexChange = 0;
+const ORB_INDEX_CHANGE_MIN_MS = 80;
   function animate(){
+    const now = performance.now();
+    const dt = Math.min(0.032, (now - lastAnimateTime) / 1000);
+    lastAnimateTime = now;
+
+    // Integrate orb scroll physics
+    if (Math.abs(orbScrollVel.value) > 0) {
+      orbScrollOffset.value += orbScrollVel.value * dt;
+      // Apply exponential friction for frame-rate independence
+      orbScrollVel.value *= Math.exp(-ORB_FRICTION * dt);
+      if (Math.abs(orbScrollVel.value) < ORB_VELOCITY_THRESHOLD) {
+        orbScrollVel.value = 0;
+      }
+
+      // Handle crossing integer boundaries (advance active index)
+      const totalImagesBoundary = uploadedImageElements.value.length;
+    // Only consume at most one index step per short time window to avoid rapid cycling
+    if (orbScrollOffset.value >= 1 || orbScrollOffset.value <= -1) {
+      const sign = orbScrollOffset.value >= 1 ? 1 : -1;
+      const nowIdx = performance.now();
+      if (nowIdx - lastOrbIndexChange >= ORB_INDEX_CHANGE_MIN_MS) {
+        if (totalImagesBoundary > 0) {
+          activeImageIndex.value = getWrappedIndex(activeImageIndex.value + sign, totalImagesBoundary);
+        }
+        orbScrollOffset.value -= sign;
+        lastOrbIndexChange = nowIdx;
+      } else {
+        // If we're inside the cooldown, clamp offset just below the integer boundary
+        // so we don't repeatedly trigger index changes until cooldown elapses.
+        const clamped = Math.sign(orbScrollOffset.value) * Math.min(0.999, Math.abs(orbScrollOffset.value));
+        orbScrollOffset.value = clamped;
+      }
+    }
+
+      syncSlotIndices();
+      orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
+      orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
+      isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
+    } else {
+      // If velocity is zero and user isn't interacting, optionally start snap to nearest
+      if (!isUserPressing.value && Math.abs(orbScrollOffset.value - Math.round(orbScrollOffset.value)) > 0.001 && orbSnapRaf === null) {
+        // startOrbSnap will handle small spring settling
+        startOrbSnap();
+      }
+    }
+
     // Handle keyboard state
     if (keyPressedA.value && keyPressedD.value) {
       // Do nothing
@@ -1229,6 +1352,8 @@ onMounted(async () => {
     if (mouseEvent.button !== 0) {
       return;
     }
+    // Prevent default dragging/selection behavior so drag only controls rotation
+    mouseEvent.preventDefault();
     const pos = { x: mouseEvent.clientX, y: mouseEvent.clientY };
     mousePrevPosition = pos;
     mouseStartPosition = pos;
@@ -1283,12 +1408,11 @@ onMounted(async () => {
     }
     const clampedDelta = Math.max(-120, Math.min(120, wheelEvent.deltaY));
     const isTrackpad = wheelEvent.deltaMode === 0;
-    const multiplier = isTrackpad ? ORB_TRACKPAD_MULTIPLIER : ORB_WHEEL_MULTIPLIER;
-    const progressFactor = isTrackpad ? ORB_SCROLL_PIXEL_TO_PROGRESS : ORB_SCROLL_LINE_TO_PROGRESS;
-    const progressDelta = clampedDelta * progressFactor * multiplier;
-    // Track last wheel delta to detect fast flicks
+    // Compute impulse from raw delta (single mapping, nonlinear)
+    const progressDelta = computeImpulseFromDelta(clampedDelta, isTrackpad);
+    // Track last wheel delta to detect fast flicks (use raw clamped value)
     try {
-      orbLastWheelDelta = progressDelta;
+      orbLastWheelDelta = clampedDelta;
     } catch {
       // silent
     }
@@ -1303,10 +1427,11 @@ onMounted(async () => {
     }, 150);
   }, { passive: false });
 
-  interactionElement.addEventListener('touchstart', touchStartCallback);
-  interactionElement.addEventListener('touchmove', touchMoveCallback);
-  interactionElement.addEventListener('touchend', touchEndCallback);
-  interactionElement.addEventListener('touchcancel', touchCancelCallback);
+  // Use non-passive touch listeners so preventDefault() in handlers stops page scrolling
+  interactionElement.addEventListener('touchstart', touchStartCallback, { passive: false });
+  interactionElement.addEventListener('touchmove', touchMoveCallback, { passive: false });
+  interactionElement.addEventListener('touchend', touchEndCallback, { passive: false });
+  interactionElement.addEventListener('touchcancel', touchCancelCallback, { passive: false });
 
   document.addEventListener('keydown', (keyEvent) => {
     if (keyEvent.code == 'KeyW') {
