@@ -16,7 +16,12 @@ const CLICK_MOVE_THRESHOLD_PX = 10;
 const facingMode = ref('unknown');
 const cameraZoom = ref(1);
 const scopeRotation = ref(0.0);
+// Independent rotations for each orb
+const scopeRotationTop = ref(0.0);
+const scopeRotationBottom = ref(0.0);
 const scopeSize = ref(1);
+const scopeRotationTopVel = ref(0.0);
+const scopeRotationBottomVel = ref(0.0);
 const scopeOffset = ref([0.0, 0.0]);
 const scopeOffsetVel = ref([0.0, 0.0]);
 const scopeSizeVel = ref(0.0);
@@ -38,6 +43,7 @@ const canvas = useTemplateRef('canvas');
 const displayCanvasCenter = useTemplateRef('display-canvas-center');
 const displayCanvasTop = useTemplateRef('display-canvas-top');
 const displayCanvasBottom = useTemplateRef('display-canvas-bottom');
+const displayCanvasIncoming = useTemplateRef('display-canvas-incoming');
 const interactionLayer = useTemplateRef('interaction-layer');
 const uploadedImageElements = ref([] as HTMLImageElement[]);
 const activeImageIndex = ref(0);
@@ -139,6 +145,78 @@ const applyOrbScrollDelta = (delta: number) => {
   isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
 };
 
+// Scroll snapping: animate orbScrollOffset to nearest integer when user stops scrolling
+let orbSnapTimeout: number | null = null;
+let orbSnapRaf: number | null = null;
+const cancelOrbSnap = () => {
+  if (orbSnapTimeout !== null) {
+    clearTimeout(orbSnapTimeout);
+    orbSnapTimeout = null;
+  }
+  if (orbSnapRaf !== null) {
+    cancelAnimationFrame(orbSnapRaf);
+    orbSnapRaf = null;
+  }
+};
+const startOrbSnap = () => {
+  cancelOrbSnap();
+  const totalImages = uploadedImageElements.value.length;
+  // Nothing to snap if there's one or no images
+  if (totalImages <= 1) return;
+  const start = orbScrollOffset.value;
+  const target = Math.round(start);
+  if (start === target) return;
+
+  // Spring parameters (tweakable)
+  const stiffness = 220; // spring stiffness
+  const damping = 26; // damping coefficient
+
+  let pos = start;
+  let vel = 0;
+  let lastTime = performance.now();
+
+  const step = (now: number) => {
+    const dt = Math.min(0.032, (now - lastTime) / 1000); // cap dt for stability
+    lastTime = now;
+
+    // Hooke's law + damping: a = -k * x - c * v
+    const x = pos - target;
+    const acc = -stiffness * x - damping * vel;
+    vel += acc * dt;
+    pos += vel * dt;
+
+    orbScrollOffset.value = pos;
+    orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
+    orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
+    isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
+
+    // Stop condition: close to target and very low velocity
+    if (Math.abs(pos - target) < 0.002 && Math.abs(vel) < 0.002) {
+      // Snap to exact target and finalize index wrap
+      orbScrollOffset.value = target;
+      const total = uploadedImageElements.value.length;
+      while (orbScrollOffset.value >= 1) {
+        activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, total);
+        orbScrollOffset.value -= 1;
+      }
+      while (orbScrollOffset.value <= -1) {
+        activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, total);
+        orbScrollOffset.value += 1;
+      }
+      orbTransitionDirection.value = 1;
+      orbTransitionProgress.value = 0;
+      isOrbTransitioning.value = false;
+      syncSlotIndices();
+      orbSnapRaf = null;
+      return;
+    }
+
+    orbSnapRaf = requestAnimationFrame(step);
+  };
+
+  orbSnapRaf = requestAnimationFrame(step);
+};
+
 const ORB_SMALL_SCALE = 0.5;
 const ORB_SCOPE_SCALE_MULTIPLIER = 0.5;
 const ORB_TOP_Y = 0;
@@ -151,8 +229,13 @@ const lerp = (start: number, end: number, progress: number): number => {
   return start + (end - start) * progress;
 };
 
-const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom') => {
-  const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
+// Easing helpers
+const easeInCubic = (t: number) => {
+  return t * t * t;
+};
+
+const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
   const direction = orbTransitionDirection.value;
   let scale = slot === 'center' ? 1 : ORB_SMALL_SCALE;
 
@@ -161,13 +244,20 @@ const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom') => {
       if (slot === 'center') {
         scale = lerp(1, ORB_SMALL_SCALE, progress);
       } else if (slot === 'bottom') {
-        scale = lerp(ORB_SMALL_SCALE, 1, progress);
+        // Ease growth as the orb approaches center so it feels smooth and accelerates toward the end
+        scale = lerp(ORB_SMALL_SCALE, 1, easeInCubic(progress));
+      } else if (slot === 'incoming') {
+        // incoming moves into the small orb slot; keep small scale
+        scale = ORB_SMALL_SCALE;
       }
     } else {
       if (slot === 'center') {
         scale = lerp(1, ORB_SMALL_SCALE, progress);
       } else if (slot === 'top') {
-        scale = lerp(ORB_SMALL_SCALE, 1, progress);
+        // Ease growth as the orb approaches center
+        scale = lerp(ORB_SMALL_SCALE, 1, easeInCubic(progress));
+      } else if (slot === 'incoming') {
+        scale = ORB_SMALL_SCALE;
       }
     }
   }
@@ -175,8 +265,8 @@ const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom') => {
   return scale;
 };
 
-const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom') => {
-  const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
+const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
   const direction = orbTransitionDirection.value;
   let scale = slot === 'center' ? 1 : ORB_SCOPE_SCALE_MULTIPLIER;
 
@@ -185,13 +275,19 @@ const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom') => {
       if (slot === 'center') {
         scale = lerp(1, ORB_SCOPE_SCALE_MULTIPLIER, progress);
       } else if (slot === 'bottom') {
-        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, progress);
+        // Ease scope growth as orb approaches center for smoother feeling
+        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, easeInCubic(progress));
+      } else if (slot === 'incoming') {
+        scale = ORB_SCOPE_SCALE_MULTIPLIER;
       }
     } else {
       if (slot === 'center') {
         scale = lerp(1, ORB_SCOPE_SCALE_MULTIPLIER, progress);
       } else if (slot === 'top') {
-        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, progress);
+        // Ease scope growth as orb approaches center
+        scale = lerp(ORB_SCOPE_SCALE_MULTIPLIER, 1, easeInCubic(progress));
+      } else if (slot === 'incoming') {
+        scale = ORB_SCOPE_SCALE_MULTIPLIER;
       }
     }
   }
@@ -199,29 +295,39 @@ const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom') => {
   return scale;
 };
 
-const getOrbStyle = (slot: 'top' | 'center' | 'bottom') => {
-  const progress = isOrbTransitioning.value ? orbTransitionProgress.value : 0;
-  const direction = orbTransitionDirection.value;
+const getOrbStyle = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
+  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
+  const direction = orbScrollOffset.value >= 0 ? 1 : -1;
 
   let topPercent = slot === 'top' ? ORB_TOP_Y : slot === 'center' ? ORB_CENTER_Y : ORB_BOTTOM_Y;
+  if (slot === 'incoming') {
+    // default offscreen position based on scroll direction
+    topPercent = direction === 1 ? ORB_OFFSCREEN_BOTTOM : ORB_OFFSCREEN_TOP;
+  }
   const scale = getOrbSizeScale(slot);
 
   if (progress > 0) {
     if (direction === 1) {
+      // scrolling "up": items move upward. incoming comes from offscreen bottom -> moves to bottom slot
       if (slot === 'top') {
         topPercent = lerp(ORB_TOP_Y, ORB_OFFSCREEN_TOP, progress);
       } else if (slot === 'center') {
         topPercent = lerp(ORB_CENTER_Y, ORB_TOP_Y, progress);
-      } else {
+      } else if (slot === 'bottom') {
         topPercent = lerp(ORB_BOTTOM_Y, ORB_CENTER_Y, progress);
+      } else if (slot === 'incoming') {
+        topPercent = lerp(ORB_OFFSCREEN_BOTTOM, ORB_BOTTOM_Y, progress);
       }
     } else {
+      // scrolling "down": items move downward. incoming comes from offscreen top -> moves to top slot
       if (slot === 'bottom') {
         topPercent = lerp(ORB_BOTTOM_Y, ORB_OFFSCREEN_BOTTOM, progress);
       } else if (slot === 'center') {
         topPercent = lerp(ORB_CENTER_Y, ORB_BOTTOM_Y, progress);
-      } else {
+      } else if (slot === 'top') {
         topPercent = lerp(ORB_TOP_Y, ORB_CENTER_Y, progress);
+      } else if (slot === 'incoming') {
+        topPercent = lerp(ORB_OFFSCREEN_TOP, ORB_TOP_Y, progress);
       }
     }
   }
@@ -926,12 +1032,22 @@ async function main(canvasElement: HTMLCanvasElement) {
     scopeOffset.value[1] += Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] + Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
 
     if (props.scopeAutoRotationVelocity !== 0) {
-      scopeRotationVel.value = clampRotationVelocity(props.scopeAutoRotationVelocity / 25);
+      // Apply base auto rotation to center orb; top/bottom receive independent multipliers
+      const baseAuto = clampRotationVelocity(props.scopeAutoRotationVelocity / 25);
+      scopeRotationVel.value = baseAuto;
+      scopeRotationTopVel.value = clampRotationVelocity(baseAuto * 0.8);
+      scopeRotationBottomVel.value = clampRotationVelocity(baseAuto * 1.2);
       scopeRotation.value += scopeRotationVel.value;
     }
     if (touchOrigin1 === null && mousePrevPosition === null) {
+      // Update center orb rotation and damp velocity
       scopeRotation.value += scopeRotationVel.value;
       scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value * 0.99);
+      // Update top and bottom orb rotations independently with light damping
+      scopeRotationTop.value += scopeRotationTopVel.value;
+      scopeRotationTopVel.value = clampRotationVelocity(scopeRotationTopVel.value * 0.995);
+      scopeRotationBottom.value += scopeRotationBottomVel.value;
+      scopeRotationBottomVel.value = clampRotationVelocity(scopeRotationBottomVel.value * 0.995);
       scopeSizeVel.value *= 0.95;
       scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1 + Math.min(scopeSizeVel.value, 0.99))));
     }
@@ -947,21 +1063,41 @@ async function main(canvasElement: HTMLCanvasElement) {
     const topImage = hasUploadedImages ? uploadedImageElements.value[topSlotIndex.value] : null;
     const centerImage = hasUploadedImages ? uploadedImageElements.value[centerSlotIndex.value] : null;
     const bottomImage = hasUploadedImages ? uploadedImageElements.value[bottomSlotIndex.value] : null;
+    const totalImages = uploadedImageElements.value.length;
+    const incomingIndex = totalImages > 0
+      ? getWrappedIndex(activeImageIndex.value + (orbScrollOffset.value >= 0 ? 2 : -2), totalImages)
+      : 0;
+    const incomingImage = totalImages > 0 ? uploadedImageElements.value[incomingIndex] : null;
     const cameraFallback = camera;
     const centerSource = getReadySource(centerImage, cameraFallback);
     const topSource = getReadySource(topImage, centerSource);
     const bottomSource = getReadySource(bottomImage, centerSource);
+    const incomingSource = getReadySource(incomingImage, centerSource);
 
+    // Shared uniforms
     gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
     gl.uniform1i(scopeShapeBind, props.scopeShape);
-    gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
-    gl.uniform1f(scopeSizeBind, scopeSize.value);
     gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
-    gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
     gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
 
+    // Top orb: use independent rotation & velocity
+    gl.uniform1f(scopeRotationBind, scopeRotationTop.value + scopeRotationOffset);
+    gl.uniform1f(rotationVelocityBind, scopeRotationTopVel.value);
     drawOrbFrame(displayCanvasTop.value ?? null, topSource ?? cameraFallback, getOrbScopeScale('top'));
+
+    // Incoming orb (during transitions) — use top orb's rotation for continuity
+    gl.uniform1f(scopeRotationBind, scopeRotationTop.value + scopeRotationOffset);
+    gl.uniform1f(rotationVelocityBind, scopeRotationTopVel.value);
+    drawOrbFrame(displayCanvasIncoming.value ?? null, incomingSource ?? cameraFallback, getOrbScopeScale('incoming'));
+
+    // Bottom orb: independent rotation & velocity
+    gl.uniform1f(scopeRotationBind, scopeRotationBottom.value + scopeRotationOffset);
+    gl.uniform1f(rotationVelocityBind, scopeRotationBottomVel.value);
     drawOrbFrame(displayCanvasBottom.value ?? null, bottomSource ?? cameraFallback, getOrbScopeScale('bottom'));
+
+    // Center orb: user-controlled rotation
+    gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
+    gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
     drawOrbFrame(displayCanvasCenter.value ?? null, centerSource ?? cameraFallback, getOrbScopeScale('center'));
 
     if (props.saveNextFrame) {
@@ -1086,6 +1222,8 @@ function touchEndCallback(event: TouchEvent) {
         }
       }
     }
+    // Snap to nearest orb after touch interaction ends
+    startOrbSnap();
     isUserPressing.value = false;
     touchId1 = null;
     touchPrev1 = null;
@@ -1100,6 +1238,8 @@ function touchEndCallback(event: TouchEvent) {
   if (touch === null) {
     return;
   }
+  // Snap after touch interaction end (non-zero-changed-touches branch)
+  startOrbSnap();
   isUserPressing.value = false;
   touchId1 = null;
   touchPrev1 = null;
@@ -1173,6 +1313,8 @@ onMounted(async () => {
     if (!didSwipe && dist < CLICK_MOVE_THRESHOLD_PX) {
       emit('upload-click');
     }
+    // Snap to nearest orb after mouse interaction ends
+    startOrbSnap();
     isUserPressing.value = false;
     mousePrevPosition = null;
     mouseStartPosition = null;
@@ -1189,6 +1331,14 @@ onMounted(async () => {
     const progressFactor = isTrackpad ? ORB_SCROLL_PIXEL_TO_PROGRESS : ORB_SCROLL_LINE_TO_PROGRESS;
     const progressDelta = clampedDelta * progressFactor * multiplier;
     applyOrbScrollDelta(progressDelta);
+    // Snap after a short pause in wheel activity
+    if (orbSnapTimeout !== null) {
+      clearTimeout(orbSnapTimeout);
+    }
+    orbSnapTimeout = window.setTimeout(() => {
+      orbSnapTimeout = null;
+      startOrbSnap();
+    }, 150);
   }, { passive: false });
 
   interactionElement.addEventListener('touchstart', touchStartCallback);
@@ -1294,6 +1444,17 @@ watch(() => props.uploadedImages, async (newImages) => {
       ref="interaction-layer"
       class="absolute inset-0 z-20 touch-none select-none"
     />
+    <!-- Incoming orb (offscreen, moves into top or bottom small orb) -->
+    <div
+      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
+      :style="getOrbStyle('incoming')"
+      aria-hidden="true"
+    >
+      <canvas
+        ref="display-canvas-incoming"
+        class="block w-full h-full object-cover"
+      />
+    </div>
     <!-- Top orb (bottom hemisphere visible) -->
     <div
       class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
