@@ -96,7 +96,7 @@ window.addEventListener('keypress', (keyEvent) => {
   <button
     v-if="canUndo"
     type="button"
-    class="fixed left-3 top-3 z-30 rounded-full bg-black/70 text-white text-xs px-3 py-1.5 shadow-md backdrop-blur-sm hover:bg-black/85 active:scale-95 transition"
+    class="fixed left-3 top-3 z-[300] rounded-full bg-black/70 text-white text-xs px-3 py-1.5 shadow-md backdrop-blur-sm hover:bg-black/85 active:scale-95 transition"
     @click.stop="undoLastRemoval"
   >
     Undo

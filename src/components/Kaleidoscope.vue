@@ -13,10 +13,11 @@ const emit = defineEmits(['save-frame', 'upload-click', 'remove-uploaded-image']
 
 const CLICK_MOVE_THRESHOLD_PX = 10;
 
+
 const facingMode = ref('unknown');
 const cameraZoom = ref(1);
 const scopeRotation = ref(0.0);
-// Independent rotations for each orb
+// Independent rotations for each orb (legacy refs kept for compatibility until full physics migration)
 const scopeRotationTop = ref(0.0);
 const scopeRotationBottom = ref(0.0);
 const scopeSize = ref(1);
@@ -45,18 +46,39 @@ const displayCanvasTop = useTemplateRef('display-canvas-top');
 const displayCanvasBottom = useTemplateRef('display-canvas-bottom');
 const displayCanvasIncoming = useTemplateRef('display-canvas-incoming');
 const interactionLayer = useTemplateRef('interaction-layer');
-const centerOrb = useTemplateRef('center-orb');
+// const centerOrb = useTemplateRef('center-orb'); // Removed
 const uploadedImageElements = ref([] as HTMLImageElement[]);
 const activeImageIndex = ref(0);
-const topSlotIndex = ref(0);
-const centerSlotIndex = ref(0);
-const bottomSlotIndex = ref(0);
-const orbTransitionProgress = ref(0.0);
-const isOrbTransitioning = ref(false);
-const orbTransitionDirection = ref<1 | -1>(1);
-const orbScrollOffset = ref(0);
-const orbScrollVel = ref(0);
-// Simplified impulse mapping (no separate multipliers)
+// Removed: topSlotIndex, centerSlotIndex, bottomSlotIndex, orbTransitionProgress, etc. as we move to new system
+
+
+interface OrbState {
+  id: string;
+  img: HTMLImageElement;
+  x: number; // visual x-offset (for dismiss/drag)
+  y: number; // visual position in pixels relative to center
+  vy: number;
+  scale: number;
+  rotation: number;
+  rotationVel: number;
+}
+
+const orbs = ref<OrbState[]>([]);
+// Global scroll anchor (target position for index 0)
+// We treat "1 unit" of scroll as "one orb height + gap"
+const scrollAnchor = ref(0);
+const scrollAnchorVel = ref(0);
+
+// Physics Constants
+// Physics Constants
+const ORB_HEIGHT_PX = Math.max(300, Math.min(window.innerWidth, window.innerHeight) * 0.64); // Match visual size (64vmin)
+const ORB_SPRING_STIFFNESS = 120;
+const ORB_SPRING_DAMPING = 20; // Critical damping ~ sqrt(4*k) -> sqrt(480) ~ 22. So 20 is slightly underdamped.
+const ORB_GAP_PX = 50; // Increased gap (reduced from 400)
+const ORB_SPACING = ORB_HEIGHT_PX + ORB_GAP_PX;
+
+// Mapping: scrollAnchor = 0 -> orb[0] is at center
+// scrollAnchor = 1 -> orb[1] is at center (orb[0] moves up)
 // Simplified impulse mapping parameters (single mapping for wheel/trackpad/touch)
 const ORB_WHEEL_DELTA_MAX = 120; // clamp reference for raw wheel delta
 const ORB_MAX_IMPULSE = 3.0; // max impulse (progress units) for strongest flick
@@ -90,6 +112,21 @@ let orbDragTouchLast: null | Point = null;
 let orbDragLastX: null | number = null;
 const pendingOrbRemovalIndex = ref<number | null>(null);
 
+// New Interaction State
+const activeOrbDragIndex = ref<number | null>(null);
+const isVerticalDrag = ref(false);
+const dragStartY = ref(0);
+const dragStartScrollOffset = ref(0);
+const dragStartTime = ref(0);
+const dragLastY = ref(0);
+const dragLastTime = ref(0);
+const dragVelocity = ref(0); // in progress units per ms
+const hasDragMoved = ref(false);
+// Conversion: pixels of drag -> 1 unit of scroll progress
+// Height of the screen roughly corresponds to moving 1 full item? 
+// Let's say moving 50% of screen height = 1 full item.
+const PIXELS_PER_SCROLL_UNIT = window.innerHeight * 0.5; 
+
 const clampRotationVelocity = (velocity: number): number => {
   return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
 };
@@ -98,6 +135,16 @@ const clampScopeSizeVelocity = (velocity: number): number => {
 };
 let texture1: WebGLTexture | null = null;
 let texture2: WebGLTexture | null = null;
+
+const canvasRefs = ref<Record<string, HTMLCanvasElement>>({});
+const setCanvasRef = (el: any, id: string) => {
+  if (el) canvasRefs.value[id] = el as HTMLCanvasElement;
+};
+
+const gridCanvasRefs = ref<Record<string, HTMLCanvasElement>>({});
+const setGridCanvasRef = (el: any, id: string) => {
+  if (el) gridCanvasRefs.value[id] = el as HTMLCanvasElement;
+};
 
 // Maximum texture dimension to reduce upload time and prevent stuttering
 const MAX_TEXTURE_SIZE = 2048;
@@ -140,36 +187,10 @@ const getWrappedIndex = (index: number, length: number): number => {
   return ((index % length) + length) % length;
 };
 
-const syncSlotIndices = () => {
-  const totalImages = uploadedImageElements.value.length;
-  if (totalImages <= 0) {
-    topSlotIndex.value = 0;
-    centerSlotIndex.value = 0;
-    bottomSlotIndex.value = 0;
-    return;
-  }
-  centerSlotIndex.value = getWrappedIndex(activeImageIndex.value, totalImages);
-  topSlotIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
-  bottomSlotIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
-};
 
-// Apply an impulse to scroll velocity (delta is in "progress" units)
-const applyOrbScrollDelta = (delta: number) => {
-  const totalImages = uploadedImageElements.value.length;
-  if (totalImages <= 1) {
-    return;
-  }
-  // Cancel any active snap while user is providing input
-  cancelOrbSnap();
-  // delta here is expected to already be a computed impulse value
-  orbScrollVel.value += delta;
-  // Clamp velocity to avoid runaway
-  orbScrollVel.value = Math.max(-ORB_MAX_VELOCITY, Math.min(ORB_MAX_VELOCITY, orbScrollVel.value));
-  // Ensure visuals update
-  orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
-  orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
-  isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
-};
+// ----------------------------------------------------------------------
+// Legacy scroll logic removed (applyOrbScrollDelta, startOrbSnap, etc.)
+// ----------------------------------------------------------------------
 
 // Convert raw input delta (wheel delta or touch delta) into a sensible impulse.
 const computeImpulseFromDelta = (rawDelta: number, isTrackpad: boolean) => {
@@ -182,242 +203,48 @@ const computeImpulseFromDelta = (rawDelta: number, isTrackpad: boolean) => {
   return sign * base * deviceScale;
 };
 
-// Scroll snapping: animate orbScrollOffset to nearest integer when user stops scrolling
-let orbSnapTimeout: number | null = null;
-let orbSnapRaf: number | null = null;
-let orbLastWheelDelta = 0;
-const cancelOrbSnap = () => {
-  if (orbSnapTimeout !== null) {
-    clearTimeout(orbSnapTimeout);
-    orbSnapTimeout = null;
-  }
-  if (orbSnapRaf !== null) {
-    cancelAnimationFrame(orbSnapRaf);
-    orbSnapRaf = null;
-  }
-};
-const ORB_FAST_SCROLL_THRESHOLD = 1.0; // progress delta threshold considered a "fast" flick
-const startOrbSnap = () => {
-  cancelOrbSnap();
-
-  // Normalize orbScrollOffset into (-1,1) by applying any full-step offsets immediately.
-  const totalImages = uploadedImageElements.value.length;
-  while (orbScrollOffset.value >= 1) {
-    if (totalImages > 0) {
-      activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, totalImages);
-    }
-    orbScrollOffset.value -= 1;
-  }
-  while (orbScrollOffset.value <= -1) {
-    if (totalImages > 0) {
-      activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, totalImages);
-    }
-    orbScrollOffset.value += 1;
-  }
-  syncSlotIndices();
-
-  const start = orbScrollOffset.value;
-  // If the last wheel flick was a fast downward flick, snap to center (0)
-  const shouldSnapToCenter = orbLastWheelDelta < -ORB_FAST_SCROLL_THRESHOLD;
-  const target = shouldSnapToCenter ? 0 : Math.round(start);
-  if (start === target) {
-    // No animation needed
-    orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
-    orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
-    isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
-    // Ensure the center orb inherits rotation from the orb that is moving into center
-    const settleDirection = start >= 0 ? 1 : -1;
-    if (settleDirection === 1) {
-      // Scrolling "up" -> bottom orb becomes center
-      scopeRotation.value = scopeRotationBottom.value;
-      scopeRotationVel.value = scopeRotationBottomVel.value;
-    } else {
-      // Scrolling "down" -> top orb becomes center
-      scopeRotation.value = scopeRotationTop.value;
-      scopeRotationVel.value = scopeRotationTopVel.value;
-    }
-    return;
-  }
-  // Spring parameters (tweakable)
-  const stiffness = 160; // spring stiffness (higher = stiffer)
-  const damping = 50; // damping coefficient (higher = more damped / less bouncy)
-
-  let pos = start;
-  let vel = 0;
-  let lastTime = performance.now();
-
-  const step = (now: number) => {
-    const dt = Math.min(0.032, (now - lastTime) / 1000); // cap dt for stability
-    lastTime = now;
-
-    // Hooke's law + damping: a = -k * x - c * v
-    const x = pos - target;
-    const acc = -stiffness * x - damping * vel;
-    vel += acc * dt;
-    pos += vel * dt;
-
-    orbScrollOffset.value = pos;
-    orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
-    orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
-    isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
-
-    // Stop condition: close to target and very low velocity
-    if (Math.abs(pos - target) < 0.002 && Math.abs(vel) < 0.002) {
-      // Snap to exact target and finalize index wrap
-      orbScrollOffset.value = target;
-      const total = uploadedImageElements.value.length;
-      while (orbScrollOffset.value >= 1) {
-        activeImageIndex.value = getWrappedIndex(activeImageIndex.value + 1, total);
-        orbScrollOffset.value -= 1;
-      }
-      while (orbScrollOffset.value <= -1) {
-        activeImageIndex.value = getWrappedIndex(activeImageIndex.value - 1, total);
-        orbScrollOffset.value += 1;
-      }
-      // Transfer rotation from the orb that moved into center for visual continuity
-      const settleDirection = start >= 0 ? 1 : -1;
-      if (settleDirection === 1) {
-        // Scrolling "up" -> bottom orb becomes center
-        scopeRotation.value = scopeRotationBottom.value;
-        scopeRotationVel.value = scopeRotationBottomVel.value;
-      } else {
-        // Scrolling "down" -> top orb becomes center
-        scopeRotation.value = scopeRotationTop.value;
-        scopeRotationVel.value = scopeRotationTopVel.value;
-      }
-      orbTransitionDirection.value = 1;
-      orbTransitionProgress.value = 0;
-      isOrbTransitioning.value = false;
-      syncSlotIndices();
-      orbSnapRaf = null;
-      return;
-    }
-
-    orbSnapRaf = requestAnimationFrame(step);
-  };
-
-  orbSnapRaf = requestAnimationFrame(step);
+// Physics-based Wheel Handler Helper
+const applyPhysicsScrollImpulse = (impulse: number) => {
+   // Impulse is in "scroll units". 
+   // We want to add to scrollAnchorVel (units/sec).
+   // If impulse is roughly 0.1 per event...
+   scrollAnchorVel.value += impulse * 5.0; 
+   scrollAnchorVel.value = Math.max(-10, Math.min(10, scrollAnchorVel.value));
 };
 
-const ORB_SMALL_SCALE = 0.5;
-const ORB_SCOPE_SCALE_MULTIPLIER = 0.5;
-const ORB_TOP_Y = 0;
-const ORB_CENTER_Y = 50;
-const ORB_BOTTOM_Y = 100;
-const ORB_OFFSCREEN_TOP = -50;
-const ORB_OFFSCREEN_BOTTOM = 150;
 
-const lerp = (start: number, end: number, progress: number): number => {
-  return start + (end - start) * progress;
-};
-
-// Compute orb visual and shader scope scale so the "snapped" orb grows up to 2x.
-// Weight mapping: center has weight 1 when fully centered; during transitions the
-// weight shifts to the incoming/target slot according to orbScrollOffset progress.
-const computeOrbWeight = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
-  const direction = orbScrollOffset.value >= 0 ? 1 : -1;
-
-  if (slot === 'center') {
-    return 1 - progress;
-  }
-  if (slot === 'bottom') {
-    return direction === 1 ? progress : 0;
-  }
-  if (slot === 'top') {
-    return direction === -1 ? progress : 0;
-  }
-  // incoming is an offscreen helper orb and should not scale as the snapped orb.
-  if (slot === 'incoming') {
-    return 0;
-  }
-  return 0;
-};
-
-const getOrbSizeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  const weight = computeOrbWeight(slot);
-  // Base visual size multiplied by (1 + weight). weight=1 -> 2x, weight=0 -> 1x.
-  return ORB_SMALL_SCALE * (1 + weight);
-};
-
-const getOrbScopeScale = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  const weight = computeOrbWeight(slot);
-  // Animate shader scope size in sync with visual orb scaling.
-  return ORB_SCOPE_SCALE_MULTIPLIER * (1 + weight);
-};
-
-const getOrbStyle = (slot: 'top' | 'center' | 'bottom' | 'incoming') => {
-  const progress = Math.min(1, Math.abs(orbScrollOffset.value));
-  const direction = orbScrollOffset.value >= 0 ? 1 : -1;
-
-  let topPercent = slot === 'top' ? ORB_TOP_Y : slot === 'center' ? ORB_CENTER_Y : ORB_BOTTOM_Y;
-  if (slot === 'incoming') {
-    // default offscreen position based on scroll direction
-    topPercent = direction === 1 ? ORB_OFFSCREEN_BOTTOM : ORB_OFFSCREEN_TOP;
-  }
-  const scale = getOrbSizeScale(slot);
-
-  if (progress > 0) {
-    if (direction === 1) {
-      // scrolling "up": items move upward. incoming comes from offscreen bottom -> moves to bottom slot
-      if (slot === 'top') {
-        topPercent = lerp(ORB_TOP_Y, ORB_OFFSCREEN_TOP, progress);
-      } else if (slot === 'center') {
-        topPercent = lerp(ORB_CENTER_Y, ORB_TOP_Y, progress);
-      } else if (slot === 'bottom') {
-        topPercent = lerp(ORB_BOTTOM_Y, ORB_CENTER_Y, progress);
-      } else if (slot === 'incoming') {
-        topPercent = lerp(ORB_OFFSCREEN_BOTTOM, ORB_BOTTOM_Y, progress);
-      }
-    } else {
-      // scrolling "down": items move downward. incoming comes from offscreen top -> moves to top slot
-      if (slot === 'bottom') {
-        topPercent = lerp(ORB_BOTTOM_Y, ORB_OFFSCREEN_BOTTOM, progress);
-      } else if (slot === 'center') {
-        topPercent = lerp(ORB_CENTER_Y, ORB_BOTTOM_Y, progress);
-      } else if (slot === 'top') {
-        topPercent = lerp(ORB_TOP_Y, ORB_CENTER_Y, progress);
-      } else if (slot === 'incoming') {
-        topPercent = lerp(ORB_OFFSCREEN_TOP, ORB_TOP_Y, progress);
-      }
-    }
-  }
-
-  const extraTranslateX = slot === 'center' ? orbDragTranslateX.value : 0;
-  const extraTranslateY = slot === 'center' ? orbDragTranslateY.value : 0;
-  // Only the center orb shrinks during drag/dismiss; top/bottom remain fixed
-  const extraScale = slot === 'center' ? orbDragScaleMultiplier.value : 1;
-
+const getOrbStyle = (orb: OrbState) => {
+  // orb.y is pixels from center (0)
+  // We center the orb at 50% of container, then translate by orb.y
+  
+  // Scale effect: Grow slightly when near center?
+  // We can compute this dynamically in the loop or here.
+  // Let's use the current "distance from 0" logic for scale visual
+  const dist = Math.abs(orb.y);
+  // Scale ends at 0.5 (half size) when distance is >= ORB_SPACING
+  // Scale is 1.0 at distance 0
+  const distRatio = Math.min(1.0, dist / ORB_SPACING);
+  const scaleFactor = 1.0 - (0.5 * distRatio); // properties: at 0 -> 1.0. at 1 -> 0.5.
+  
+  const visualScale = orb.scale * scaleFactor;
+  
+  // Center Orbit Drag/Dismiss logic (only if active?)
+  // If we want to support dragging ANY orb, we can check IDs.
+  // For now, let's just apply the transform.
+  
   return {
-    top: `${topPercent}%`,
-    transform: `translate(-50%, -50%) translate(${extraTranslateX}px, ${extraTranslateY}px) scale(${scale * extraScale})`,
+     top: '50%',
+     transform: `translate(-50%, -50%) translate(${orb.x}px, ${orb.y}px) scale(${visualScale})`,
+     zIndex: Math.round(100 - dist / 10), // closer -> higher z-index
   };
 };
 
-// Center orb style wrapper so we can hide it during dismiss animations
-const getCenterOrbStyle = (): Record<string, string> => {
-  const s = getOrbStyle('center') as Record<string, string>;
-  if (isCenterHiddenDuringDismiss.value) {
-    s.opacity = '0';
-    s.pointerEvents = 'none';
-  }
-  return s;
+const getOrbScopeScale = (axis?: any) => {
+   // Legacy shim for drawOrbFrame to compile
+   return 1.0; 
 };
 
-const SWIPE_DISTANCE_PX = 60;
-const isSwipeGesture = (deltaX: number, deltaY: number): boolean => {
-  return Math.abs(deltaY) >= SWIPE_DISTANCE_PX && Math.abs(deltaY) > Math.abs(deltaX);
-};
 
-const handleSwipeGesture = (deltaX: number, deltaY: number): boolean => {
-  if (!isSwipeGesture(deltaX, deltaY)) {
-    return false;
-  }
-  // Map swipe distance to impulse (treat as touch, not trackpad)
-  const progressDelta = computeImpulseFromDelta(-deltaY, false);
-  applyOrbScrollDelta(progressDelta);
-  return true;
-};
 
 const getReadySource = (
   primary: HTMLImageElement | HTMLVideoElement | null,
@@ -438,9 +265,11 @@ const getReadySource = (
   return fallback;
 };
 
+
 const loadUploadedImages = async (imageSrcs: string[]) => {
   if (imageSrcs.length > 0) {
-    const loadedImages: HTMLImageElement[] = [];
+    const loadedOrbs: OrbState[] = [];
+    let index = 0;
     for (const src of imageSrcs) {
       const img = new Image();
       img.crossOrigin = 'anonymous';
@@ -449,30 +278,44 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
         img.onload = resolve;
         img.onerror = reject;
       });
-      // Resize image to reduce upload time and prevent stuttering
       const resizedImg = await resizeImage(img);
-      loadedImages.push(resizedImg);
+      
+      // Initialize orb state
+      // Initial position: stacked vertically based on index
+      // Target position will be calculated in the physics loop
+      loadedOrbs.push({
+        id: `orb-${Date.now()}-${index}`,
+        img: resizedImg,
+        x: 0,
+        y: index * ORB_SPACING, // Initial placement
+        vy: 0,
+        scale: 1,
+        rotation: 0,
+        rotationVel: 0
+      });
+      index++;
     }
-    uploadedImageElements.value = loadedImages;
-    activeImageIndex.value = 0;
-    orbScrollOffset.value = 0;
-    syncSlotIndices();
-    orbTransitionProgress.value = 0.0;
-    isOrbTransitioning.value = false;
-    facingMode.value = 'environment'; // Don't flip uploaded images (x-flip is only for user-facing webcam)
     
-    // Stop camera stream if images are uploaded
+    // Update State
+    uploadedImageElements.value = loadedOrbs.map(o => o.img); // Keep for legacy compat references if needed
+    orbs.value = loadedOrbs;
+    activeImageIndex.value = 0;
+    
+    // Reset Scroll Anchor to 0
+    scrollAnchor.value = 0;
+    scrollAnchorVel.value = 0;
+    
+    facingMode.value = 'environment';
+    
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
       cameraStream = null;
     }
   } else {
     uploadedImageElements.value = [];
+    orbs.value = [];
     activeImageIndex.value = 0;
-    orbScrollOffset.value = 0;
-    syncSlotIndices();
-    orbTransitionProgress.value = 0.0;
-    isOrbTransitioning.value = false;
+    scrollAnchor.value = 0;
   }
 };
 
@@ -1050,143 +893,127 @@ async function main(canvasElement: HTMLCanvasElement) {
     renderToDisplayCanvas(displayCanvas, canvasElement);
   };
 
+
+  // setCanvasRef definition removed from here (moved to top level)
+
   let lastAnimateTime = performance.now();
-// Throttle rapid index changes so interrupting a snap doesn't cycle images wildly
-let lastOrbIndexChange = 0;
-const ORB_INDEX_CHANGE_MIN_MS = 80;
+  
   function animate(){
     const now = performance.now();
-    const dt = Math.min(0.032, (now - lastAnimateTime) / 1000);
+    const dt = Math.min(0.032, (now - lastAnimateTime) / 1000); // sec
     lastAnimateTime = now;
 
-    // Integrate orb scroll physics (skip while fill animation is running)
-    if (!orbFillAnimating.value && Math.abs(orbScrollVel.value) > 0) {
-      orbScrollOffset.value += orbScrollVel.value * dt;
-      // Apply exponential friction for frame-rate independence
-      orbScrollVel.value *= Math.exp(-ORB_FRICTION * dt);
-      if (Math.abs(orbScrollVel.value) < ORB_VELOCITY_THRESHOLD) {
-        orbScrollVel.value = 0;
-      }
+    // 1. Scroll Anchor Physics
+    
+    // Bounds (Rubber Band targets)
+    // Add +1 slot for the grid gallery at the bottom
+    const maxScroll = Math.max(0, orbs.value.length);
+    let target = null; // If non-null, we spring towards this
 
-      // Handle crossing integer boundaries (advance active index)
-      const totalImagesBoundary = uploadedImageElements.value.length;
-    // Only consume at most one index step per short time window to avoid rapid cycling
-    if (orbScrollOffset.value >= 1 || orbScrollOffset.value <= -1) {
-      const sign = orbScrollOffset.value >= 1 ? 1 : -1;
-      const nowIdx = performance.now();
-      if (nowIdx - lastOrbIndexChange >= ORB_INDEX_CHANGE_MIN_MS) {
-        if (totalImagesBoundary > 0) {
-          activeImageIndex.value = getWrappedIndex(activeImageIndex.value + sign, totalImagesBoundary);
+    if (!isUserPressing.value) {
+       // A. Out of Bounds -> strong snap back
+       if (scrollAnchor.value < -0.01) {
+          target = 0;
+       } else if (scrollAnchor.value > maxScroll + 0.01) {
+          target = maxScroll;
+       } 
+       // B. In Bounds -> Friction or Snap
+       else {
+          // If velocity is high, just apply simple friction ("Free Glide")
+          // If velocity is low, OR we are very close to a snap point, engage snap.
+          
+          // "Capture" threshold: slowing down enough to pick a parking spot.
+          // Units are "orbs per second". 2.0 is moderate speed.
+          const isSlowEnoughToSnap = Math.abs(scrollAnchorVel.value) < 2.0;
+          
+          if (isSlowEnoughToSnap) {
+             // Predictive snap: where would we land if we coasted?
+             // Simple prediction: snap to nearest integer in direction of travel, or just nearest integer.
+             // Adding a small lookahead (velocity * 0.15) helps feel "responsive" to the fling.
+             const predictedPos = scrollAnchor.value + scrollAnchorVel.value * 0.15;
+             target = Math.round(predictedPos);
+          } else {
+             // Free Glide with Friction
+             // Exponential decay friction
+             const frictionCoeff = 3.0; // Higher = stops faster
+             scrollAnchorVel.value *= Math.exp(-frictionCoeff * dt);
+          }
+       }
+       
+       // If we have a target, apply Spring-Damper physics
+       if (target !== null) {
+          const dist = target - scrollAnchor.value;
+          
+          // Tuned Spring Constants for "Crisp" feel
+          const tension = 180.0;
+          const friction = 26.0; // Critical damping is ~ 2 * sqrt(tension) ≈ 2 * 13.4 ≈ 27
+          
+          const force = dist * tension - scrollAnchorVel.value * friction;
+          scrollAnchorVel.value += force * dt;
+       }
+       
+       // Update position
+       scrollAnchor.value += scrollAnchorVel.value * dt;
+
+    } else {
+       // User is pressing -> Direct control (velocity is tracked in handlers), just update pos?
+       // Actually handlers update scrollAnchor directly for 1:1 feel, 
+       // but we tracked velocity for the release throw.
+       // So here we do nothing to scrollAnchor.
+    }
+
+    // 2. Orb Physics & Rendering (Moved Rotation Physics here)
+    const visibleOrbs: OrbState[] = [];
+    
+    // Auto-rotation base velocity
+    const autoRotVel = props.scopeAutoRotationVelocity !== 0 
+        ? clampRotationVelocity(props.scopeAutoRotationVelocity / 25) 
+        : 0;
+
+    for (let i = 0; i < orbs.value.length; i++) {
+        const orb = orbs.value[i];
+        
+        // Target Y Position
+        const targetY = (i - scrollAnchor.value) * ORB_SPACING;
+        
+        // Spring Force for Position
+        const dist = targetY - orb.y;
+        const springF = dist * ORB_SPRING_STIFFNESS;
+        const dampingF = -orb.vy * ORB_SPRING_DAMPING;
+        const totalF = springF + dampingF;
+        
+        orb.vy += totalF * dt;
+        orb.y += orb.vy * dt;
+        
+        // --- Independent Rotation Physics ---
+        // Apply auto-rotation driven velocity if set, otherwise just decay
+        if (autoRotVel !== 0) {
+           // Blend active velocity towards auto-velocity? 
+           // Or just set it if it's the dominant force?
+           // Original logic was: set it, then decay. 
+           // To allow manual spin to override, we only apply auto if velocity is small?
+           // Or just treat auto as a force?
+           // Let's adopt the "set and decay" pattern from original checks but per orb, 
+           // allowing manual impulses (which add large velocity) to temporarily override.
+           
+           // If user isn't actively spinning this orb (velocity is low/decayed), push it.
+           // This is a heuristic.
+           if (Math.abs(orb.rotationVel) < Math.abs(autoRotVel)) {
+              orb.rotationVel = autoRotVel;
+           }
         }
-        orbScrollOffset.value -= sign;
-        lastOrbIndexChange = nowIdx;
-      } else {
-        // If we're inside the cooldown, clamp offset just below the integer boundary
-        // so we don't repeatedly trigger index changes until cooldown elapses.
-        const clamped = Math.sign(orbScrollOffset.value) * Math.min(0.999, Math.abs(orbScrollOffset.value));
-        orbScrollOffset.value = clamped;
-      }
+        
+        orb.rotation += orb.rotationVel;
+        orb.rotationVel *= 0.98; // Angular Drag
+        
+        // Render if visible (gross culling)
+        if (Math.abs(orb.y) < window.innerHeight) { 
+             visibleOrbs.push(orb);
+        }
     }
-
-      syncSlotIndices();
-      orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
-      orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
-      isOrbTransitioning.value = orbTransitionProgress.value > 0.001;
-    } else if (!orbFillAnimating.value) {
-      // If velocity is zero and user isn't interacting, optionally start snap to nearest
-      if (!isUserPressing.value && Math.abs(orbScrollOffset.value - Math.round(orbScrollOffset.value)) > 0.001 && orbSnapRaf === null) {
-        // startOrbSnap will handle small spring settling
-        startOrbSnap();
-      }
-    }
-
-    // Handle keyboard state
-    if (keyPressedA.value && keyPressedD.value) {
-      // Do nothing
-    } else if (keyPressedA.value) {
-      scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value - fastNormalSlow(0.001, 0.0002, 0.00005));
-    } else if (keyPressedD.value) {
-      scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value + fastNormalSlow(0.001, 0.0002, 0.00005));
-    }
-    if (keyPressedW.value && keyPressedS.value) {
-      // Do nothing
-    } else if (keyPressedW.value) {
-      scopeSizeVel.value += fastNormalSlow(0.001, 0.0002, 0.00005);
-    } else if (keyPressedS.value) {
-      scopeSizeVel.value -= fastNormalSlow(0.001, 0.0002, 0.00005);
-    }
-    if (keyPressedI.value && keyPressedK.value) {
-      // Do nothing
-    } else if (keyPressedI.value) {
-      scopeOffsetVel.value[0] -= 0.0002 / scopeSize.value;
-    } else if (keyPressedK.value) {
-      scopeOffsetVel.value[0] += 0.0002 / scopeSize.value;
-    }
-    if (keyPressedJ.value && keyPressedL.value) {
-      // Do nothing
-    } else if (keyPressedJ.value) {
-      scopeOffsetVel.value[1] += 0.0002 / scopeSize.value;
-    } else if (keyPressedL.value) {
-      scopeOffsetVel.value[1] -= 0.0002 / scopeSize.value;
-    }
-    if (keyPressedMinus.value && keyPressedPlus.value) {
-      // Do nothing
-    } else if (keyPressedMinus.value) {
-      cameraZoom.value = Math.max(1, cameraZoom.value * 0.95);
-    } else if (keyPressedPlus.value) {
-      cameraZoom.value = Math.min(10, cameraZoom.value * 1.05);
-    }
-
-    let scopeRotationOffset = 0;
-    if (props.scopeShape === ScopeShape.Equilateral) {
-      scopeRotationOffset = Math.PI / 3;
-    }
-
-    scopeOffset.value[0] += Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] - Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
-    scopeOffset.value[1] += Math.cos(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[0] + Math.sin(-scopeRotation.value - scopeRotationOffset) * scopeOffsetVel.value[1];
-
-    if (props.scopeAutoRotationVelocity !== 0) {
-      // Apply base auto rotation to center orb; top/bottom receive independent multipliers
-      const baseAuto = clampRotationVelocity(props.scopeAutoRotationVelocity / 25);
-      scopeRotationVel.value = baseAuto;
-      scopeRotationTopVel.value = clampRotationVelocity(baseAuto * 0.8);
-      scopeRotationBottomVel.value = clampRotationVelocity(baseAuto * 1.2);
-      scopeRotation.value += scopeRotationVel.value;
-    }
-    if (touchOrigin1 === null && mousePrevPosition === null) {
-      // Update center orb rotation and damp velocity
-      scopeRotation.value += scopeRotationVel.value;
-      scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value * 0.99);
-      // Update top and bottom orb rotations independently with light damping
-      scopeRotationTop.value += scopeRotationTopVel.value;
-      scopeRotationTopVel.value = clampRotationVelocity(scopeRotationTopVel.value * 0.995);
-      scopeRotationBottom.value += scopeRotationBottomVel.value;
-      scopeRotationBottomVel.value = clampRotationVelocity(scopeRotationBottomVel.value * 0.995);
-      scopeSizeVel.value *= 0.95;
-      scopeSize.value = Math.max(0.5, Math.min(1, scopeSize.value * (1 + Math.min(scopeSizeVel.value, 0.99))));
-    }
-    scopeOffsetVel.value[0] *= 0.95;
-    scopeOffsetVel.value[1] *= 0.95;
-
-    if (orbTransitionProgress.value <= 0.001) {
-      isOrbTransitioning.value = false;
-      orbTransitionProgress.value = 0.0;
-    }
-
-    const hasUploadedImages = uploadedImageElements.value.length > 0;
-    const topImage = hasUploadedImages ? uploadedImageElements.value[topSlotIndex.value] : null;
-    const centerImage = hasUploadedImages ? uploadedImageElements.value[centerSlotIndex.value] : null;
-    const bottomImage = hasUploadedImages ? uploadedImageElements.value[bottomSlotIndex.value] : null;
-    const totalImages = uploadedImageElements.value.length;
-    const incomingIndex = totalImages > 0
-      ? getWrappedIndex(activeImageIndex.value + (orbScrollOffset.value >= 0 ? 2 : -2), totalImages)
-      : 0;
-    const incomingImage = totalImages > 0 ? uploadedImageElements.value[incomingIndex] : null;
+    
+    // 3. Render Cycle
     const cameraFallback = camera;
-    const centerSource = getReadySource(centerImage, cameraFallback);
-    const topSource = getReadySource(topImage, centerSource);
-    const bottomSource = getReadySource(bottomImage, centerSource);
-    const incomingSource = getReadySource(incomingImage, centerSource);
 
     // Shared uniforms
     gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
@@ -1194,25 +1021,43 @@ const ORB_INDEX_CHANGE_MIN_MS = 80;
     gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
     gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
 
-    // Top orb: use independent rotation & velocity
-    gl.uniform1f(scopeRotationBind, scopeRotationTop.value + scopeRotationOffset);
-    gl.uniform1f(rotationVelocityBind, scopeRotationTopVel.value);
-    drawOrbFrame(displayCanvasTop.value ?? null, topSource ?? cameraFallback, getOrbScopeScale('top'));
+    visibleOrbs.forEach(orb => {
+        const source = getReadySource(orb.img, cameraFallback);
+        const displayCanvas = canvasRefs.value[orb.id];
+        
+        if (displayCanvas) {
+             gl.uniform1f(scopeRotationBind, orb.rotation);
+             gl.uniform1f(rotationVelocityBind, orb.rotationVel);
+             
+             // Scale effect: Grow slightly when near center?
+             const dist = Math.abs(orb.y);
+             const proximity = Math.max(0, 1 - dist / 400); // 0..1
+             const scaleEffect = 1 + proximity * 0.2;
+             
+             drawOrbFrame(displayCanvas, source ?? cameraFallback, getOrbScopeScale('center') * scaleEffect); 
+        }
+    });
 
-    // Incoming orb (during transitions) — use top orb's rotation for continuity
-    gl.uniform1f(scopeRotationBind, scopeRotationTop.value + scopeRotationOffset);
-    gl.uniform1f(rotationVelocityBind, scopeRotationTopVel.value);
-    drawOrbFrame(displayCanvasIncoming.value ?? null, incomingSource ?? cameraFallback, getOrbScopeScale('incoming'));
-
-    // Bottom orb: independent rotation & velocity
-    gl.uniform1f(scopeRotationBind, scopeRotationBottom.value + scopeRotationOffset);
-    gl.uniform1f(rotationVelocityBind, scopeRotationBottomVel.value);
-    drawOrbFrame(displayCanvasBottom.value ?? null, bottomSource ?? cameraFallback, getOrbScopeScale('bottom'));
-
-    // Center orb: user-controlled rotation
-    gl.uniform1f(scopeRotationBind, scopeRotation.value + scopeRotationOffset);
-    gl.uniform1f(rotationVelocityBind, scopeRotationVel.value);
-    drawOrbFrame(displayCanvasCenter.value ?? null, centerSource ?? cameraFallback, getOrbScopeScale('center'));
+    // 4. Grid Gallery Rendering (If visible)
+    // Check if we are physically near the bottom
+    // We render grid if scrollAnchor is nearing the end
+    const distFromBottom = Math.max(0, (orbs.value.length - scrollAnchor));
+    // distFromBottom: 0 = fully at bottom (grid centered). 1 = 1 orb away.
+    // Show grid if within ~2 screens of bottom?
+    // Grid opacity logic in template: 1 - Math.abs((length - scroll) * 0.5)
+    // So visible when abs diff < 2.
+    if (Math.abs(orbs.value.length - scrollAnchor) < 3.0) {
+        orbs.value.forEach(orb => {
+            const gridCanvas = gridCanvasRefs.value[orb.id];
+            if (gridCanvas) {
+                const source = getReadySource(orb.img, cameraFallback);
+                gl.uniform1f(scopeRotationBind, orb.rotation);
+                gl.uniform1f(rotationVelocityBind, orb.rotationVel);
+                // No extra scale effect for grid items
+                drawOrbFrame(gridCanvas, source ?? cameraFallback, 1.0);
+            }
+        });
+    }
 
     if (props.saveNextFrame) {
       emit(
@@ -1253,26 +1098,35 @@ function touchDistance(t1: Touch, t2: Touch): number {
 
 // Helper: determine if a point/event is inside the center orb element
 type PointLike = { clientX?: number; clientY?: number; x?: number; y?: number };
+
+const getOrbIndexAtPoint = (p: {x: number, y: number}) => {
+   // Only check visible orbs
+   // Hit test: circle collision
+   // We need to know where each orb is VISUALLY.
+   // The 'orb.y' property is relative to the center.
+   const cx = window.innerWidth / 2;
+   const cy = window.innerHeight / 2;
+   // Approx size (from CSS 64vmin, min 160px)
+   const vmin = Math.min(window.innerWidth, window.innerHeight);
+   const radius = Math.max(160, vmin * 0.64) / 2;
+   
+   for (let i = 0; i < orbs.value.length; i++) {
+      const orb = orbs.value[i];
+      const orbScreenY = cy + orb.y;
+      const orbScreenX = cx + orb.x; // usually 0 unless dismissing
+      const dx = p.x - orbScreenX;
+      const dy = p.y - orbScreenY;
+      if (Math.hypot(dx, dy) <= radius) {
+         return i;
+      }
+   }
+   return -1;
+};
+
+// Legacy hit test replaced by getOrbIndexAtPoint(pos) !== -1
 const isPointInsideCenterOrb = (p: PointLike | Touch | MouseEvent): boolean => {
-  const obj = p as PointLike;
-  let clientX = 0;
-  let clientY = 0;
-  if (typeof obj.clientX === 'number') {
-    clientX = obj.clientX;
-  } else if (typeof obj.x === 'number') {
-    clientX = obj.x;
-  }
-  if (typeof obj.clientY === 'number') {
-    clientY = obj.clientY;
-  } else if (typeof obj.y === 'number') {
-    clientY = obj.y;
-  }
-  const el = centerOrb.value as HTMLDivElement | undefined;
-  if (!el) return false;
-  const rect = el.getBoundingClientRect();
-  const dx = clientX - (rect.left + rect.width / 2);
-  const dy = clientY - (rect.top + rect.height / 2);
-  return Math.hypot(dx, dy) <= Math.min(rect.width, rect.height) / 2;
+    // Unused now
+    return false;
 };
 
 // Reset drag visuals for center orb
@@ -1287,94 +1141,86 @@ const resetOrbDragVisuals = () => {
 };
 
 // Set drag visuals while dragging
+// Set drag visuals while dragging
 const setOrbDragVisuals = (deltaX: number) => {
-  orbDragTranslateX.value = deltaX;
-  orbDragTranslateY.value = 0;
-  // modest scale down while dragging
-  orbDragScaleMultiplier.value = Math.max(0.85, 1 - Math.abs(deltaX) / 1000);
+  if (activeOrbDragIndex.value !== null && activeOrbDragIndex.value >= 0 && activeOrbDragIndex.value < orbs.value.length) {
+      orbs.value[activeOrbDragIndex.value].x = deltaX;
+  }
 };
 
 const getCenterOrbDismissThresholdPx = (): number => {
-  return Math.max(60, Math.round(Math.min(window.innerWidth, window.innerHeight) * 0.15));
+  return Math.max(100, Math.round(Math.min(window.innerWidth, window.innerHeight) * 0.30));
+};
+
+const bounceBackOrb = async (index: number) => {
+  if (index < 0 || index >= orbs.value.length) return;
+  const orb = orbs.value[index];
+  if (!orb) return;
+
+  const startX = orb.x;
+  const targetX = 0;
+  const startTime = performance.now();
+  const duration = 400;
+
+  while (true) {
+     const now = performance.now();
+     const p = Math.min(1, (now - startTime) / duration);
+     const ease = 1 - Math.pow(1 - p, 5); 
+     orb.x = startX + (targetX - startX) * ease;
+     if (p >= 1) break;
+     await new Promise(r => requestAnimationFrame(r));
+  }
+  orb.x = 0;
 };
 
 const dismissActiveOrb = async (direction: 1 | -1, removeIndex: number) => {
-  if (uploadedImageElements.value.length === 0) return;
+  if (removeIndex < 0 || removeIndex >= orbs.value.length) return;
+  const orb = orbs.value[removeIndex];
+  if (!orb) return;
+
   isOrbDismissing.value = true;
+  
+  // Animate X out
+  const startX = orb.x;
+  const targetX = direction * window.innerWidth;
+  const startTime = performance.now();
+  const duration = ORB_DISMISS_DURATION_MS;
+  
+  // Simple animation loop (blocking)
+  while (true) {
+     const now = performance.now();
+     const p = Math.min(1, (now - startTime) / duration);
+     // Ease out
+     const ease = 1 - Math.pow(1 - p, 3);
+     orb.x = startX + (targetX - startX) * ease;
+     if (p >= 1) break;
+     await new Promise(r => requestAnimationFrame(r));
+  }
+  
+  // Remove
   pendingOrbRemovalIndex.value = removeIndex;
-  // animate by setting translate and scale
-  orbDragTranslateX.value = direction * (getCenterOrbDismissThresholdPx() + 20);
-  orbDragScaleMultiplier.value = 0.85;
-  // First, wait for the horizontal dismiss visual to complete (center orb moves offscreen).
-  await new Promise<void>(resolve => setTimeout(() => resolve(), ORB_DISMISS_DURATION_MS));
-
-  // Hide the center DOM so it does not immediately reappear with a different photo.
-  isCenterHiddenDuringDismiss.value = true;
-
-  // Prevent any ongoing scroll physics/snapping from interfering with the fill animation.
-  orbScrollVel.value = 0;
-  cancelOrbSnap();
-  // Animate the vertical orb-stack fill (other orbs move into center). This is strictly vertical.
-  await animateOrbStackFill(direction, ORB_DISMISS_DURATION_MS);
-
-  // Perform local removal so UI updates after the fill animation completes.
   removeUploadedImageAtIndex(removeIndex);
-  // Notify parent about removal (watch handler will detect pending removal and avoid double-removal).
   emit('remove-uploaded-image', removeIndex);
-
-  // Reveal center orb now that the vertical fill animation and local removal completed.
-  isCenterHiddenDuringDismiss.value = false;
-
-  // cleanup
+  
   isOrbDismissing.value = false;
-  resetOrbDragVisuals();
-};
-
-// Animate the orb stack so top/center/bottom visually shift to fill a removed center orb.
-// direction: 1 => bottom moves into center (scroll up), -1 => top moves into center (scroll down)
-const animateOrbStackFill = (direction: 1 | -1, durationMs: number) => {
-  return new Promise<void>((resolve) => {
-    const start = performance.now();
-    const from = 0;
-    const to = direction;
-    // easing
-    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
-
-    isOrbTransitioning.value = true;
-    orbTransitionDirection.value = direction;
-    orbFillAnimating.value = true;
-
-    const step = (now: number) => {
-      const elapsed = Math.min(durationMs, now - start);
-      const t = durationMs > 0 ? elapsed / durationMs : 1;
-      const eased = easeOutCubic(t);
-      orbScrollOffset.value = lerp(from, to, eased);
-      orbTransitionDirection.value = orbScrollOffset.value >= 0 ? 1 : -1;
-      orbTransitionProgress.value = Math.min(1, Math.abs(orbScrollOffset.value));
-
-      if (elapsed >= durationMs) {
-        // finish animation
-        orbScrollOffset.value = 0; // reset offset; actual new center will be set by local removal & syncSlotIndices
-        orbTransitionProgress.value = 0;
-        isOrbTransitioning.value = false;
-        orbFillAnimating.value = false;
-        resolve();
-        return;
-      }
-      requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  });
+  
+  // The physics loop will automatically pull the next orbs up to fill the gap.
 };
 
 const removeUploadedImageAtIndex = (index: number) => {
   if (index < 0 || index >= uploadedImageElements.value.length) return;
+  // Remove from arrays
   uploadedImageElements.value.splice(index, 1);
+  if (index < orbs.value.length) {
+     orbs.value.splice(index, 1);
+  }
+  
   if (activeImageIndex.value >= uploadedImageElements.value.length) {
     activeImageIndex.value = Math.max(0, uploadedImageElements.value.length - 1);
   }
-  syncSlotIndices();
+  // No syncSlotIndices needed, physics handles it
 };
+
 
 function touchStartCallback(event: TouchEvent) {
   event.preventDefault();
@@ -1393,18 +1239,31 @@ function touchStartCallback(event: TouchEvent) {
   }
   if (len === 1 && touchId1 === null && pinchPrevDist === null) {
     const touch = event.changedTouches[0];
-    // If user starts within the center orb and we have an uploaded stack, treat horizontal drag as dismiss gesture.
-    if (
+    
+    // Initialize new drag state
+    isVerticalDrag.value = false;
+    hasDragMoved.value = false;
+    dragStartY.value = touch.clientY;
+    dragVelocity.value = 0;
+    
+    dragStartScrollOffset.value = scrollAnchor.value;
+    
+    // Check hit test
+    const targetOrbIndex = getOrbIndexAtPoint({x: touch.clientX, y: touch.clientY});
+    const shouldOrbDrag =
       uploadedImageElements.value.length > 0 &&
-      !isOrbTransitioning.value &&
       !isOrbDismissing.value &&
-      isPointInsideCenterOrb(touch)
-    ) {
+      targetOrbIndex !== -1;
+
+    if (shouldOrbDrag) {
+      activeOrbDragIndex.value = targetOrbIndex;
       orbDragTouchActive = true;
       orbDragTouchLast = touch;
       orbDragLastX = touch.clientX;
       isOrbDragging.value = true;
+      orbDragTranslateX.value = 0;
     } else {
+      activeOrbDragIndex.value = null;
       orbDragTouchActive = false;
       orbDragTouchLast = null;
       isOrbDragging.value = false;
@@ -1416,6 +1275,8 @@ function touchStartCallback(event: TouchEvent) {
     isUserPressing.value = true;
     scopeRotationVel.value = 0;
     scopeSizeVel.value = 0;
+    scopeSizeVel.value = 0;
+    scrollAnchorVel.value = 0; // Stop existing scroll momentum on touch down
   }
 }
 
@@ -1435,34 +1296,44 @@ function touchMoveCallback(event: TouchEvent) {
     if (touch === null) {
       return;
     }
-    if (orbDragTouchActive) {
-      // Rotate kaleidoscope incrementally based on horizontal drag delta
-      const now = performance.now();
-      const prevX = orbDragLastX ?? touch.clientX;
-      const dx = touch.clientX - prevX;
-      const dt = Math.max(1, now - touchPrevTime);
-      // Sensitivity tuned for pleasant feel
-      scopeRotation.value += dx / 300;
-      scopeRotationVel.value = clampRotationVelocity((dx / dt) * 0.02);
-      orbDragLastX = touch.clientX;
-      orbDragTouchLast = touch;
-      setOrbDragVisuals(touch.clientX - touchOrigin1.clientX);
-      touchPrevTime = now;
-      return;
-    }
-    if (new Date().getTime() - touchPrevTime < 0.001) {
-      return;
-    }
-    const deltaTime = Math.max(new Date().getTime() - touchPrevTime, 0.001);
-    const deltaX = (touch.clientX - touchPrev1.clientX) / deltaTime;
+    
+    const now = performance.now();
+    const dt = Math.max(1, now - dragLastTime.value);
+    const dy = touch.clientY - dragLastY.value;
+    
+    // Unified Drag Logic (Vertical Scroll + Horizontal Move)
 
-    scopeRotation.value -= deltaX / 22;
-    if (Math.abs(touch.clientX - touchPrev1.clientX) > 1) {
-      scopeRotationVel.value = clampRotationVelocity(-deltaX / 22);
-    } else {
-      scopeRotationVel.value = 0;
-    }
+    // 1. Vertical Drag (Scroll)
+    const totalDragY = touch.clientY - dragStartY.value;
+    const progressDelta = -totalDragY / ORB_SPACING; // Up drag (negative Y) -> Positive scroll
+    scrollAnchor.value = dragStartScrollOffset.value + progressDelta;
+    
+    // Update velocity for momentum (using immediate dy for responsiveness)
+    scrollAnchorVel.value = (-dy / ORB_SPACING) / (dt / 1000); 
 
+    // 2. Horizontal Drag (Rotation / Dismiss) - Only if dragging a specific orb
+    if (orbDragTouchActive && activeOrbDragIndex.value !== null) {
+      const index = activeOrbDragIndex.value;
+      const orb = orbs.value[index];
+      if (orb) {
+          // Rotate kaleidoscope incrementally based on horizontal drag delta
+          const prevX = orbDragLastX ?? touch.clientX;
+          const dx = touch.clientX - prevX;
+          const dtMove = Math.max(1, now - touchPrevTime);
+          
+          orb.rotation += dx / 300;
+          orb.rotationVel = clampRotationVelocity((dx / dtMove) * 0.02);
+          
+          orbDragLastX = touch.clientX;
+          orbDragTouchLast = touch;
+          setOrbDragVisuals(touch.clientX - touchOrigin1.clientX);
+      }
+    }
+    
+    hasDragMoved.value = true; // Mark as moved so we don't treat as a static click later
+    
+    dragLastY.value = touch.clientY;
+    dragLastTime.value = now;
     touchPrevTime = new Date().getTime();
     touchPrev1 = touch;
   }
@@ -1482,38 +1353,52 @@ function touchEndCallback(event: TouchEvent) {
     touchOrigin1 = remaining;
     touchPrevTime = new Date().getTime();
     isUserPressing.value = true;
+    
+    // Reset drag tracking for the new "single" touch
+    isVerticalDrag.value = false;
+    hasDragMoved.value = false;
+    dragStartY.value = remaining.clientY;
+    dragStartScrollOffset.value = scrollAnchor.value;
   }
   if (len === 0) {
+
+    // Both momentum and dismiss checks happen now
+
+    // Horizontal Dismiss / Bounce Logic
     if (orbDragTouchActive && touchOrigin1 !== null) {
       const last = orbDragTouchLast ?? (touchId1 !== null ? getTouchById(event.changedTouches, touchId1) : null);
       const deltaX = last ? last.clientX - touchOrigin1.clientX : orbDragTranslateX.value;
       const threshold = getCenterOrbDismissThresholdPx();
       const direction: 1 | -1 = deltaX >= 0 ? 1 : -1;
-      const removeIndex = centerSlotIndex.value;
+      
+      const draggedIndex = activeOrbDragIndex.value ?? -1;
+      activeOrbDragIndex.value = null;
 
       orbDragTouchActive = false;
       orbDragTouchLast = null;
       isOrbDragging.value = false;
 
-      if (Math.abs(deltaX) >= threshold && uploadedImageElements.value.length > 0) {
-        void dismissActiveOrb(direction, removeIndex);
+      if (Math.abs(deltaX) >= threshold && uploadedImageElements.value.length > 0 && draggedIndex !== -1) {
+        void dismissActiveOrb(direction, draggedIndex);
       } else {
-        resetOrbDragVisuals();
+        if (draggedIndex !== -1) {
+            void bounceBackOrb(draggedIndex);
+        }
       }
     } else if (touchId1 !== null && touchOrigin1 !== null) {
+       // Tap check
       const touch = getTouchById(event.changedTouches, touchId1);
       if (touch !== null) {
         const deltaX = touch.clientX - touchOrigin1.clientX;
         const deltaY = touch.clientY - touchOrigin1.clientY;
         const dist = Math.hypot(deltaX, deltaY);
-        const didSwipe = handleSwipeGesture(deltaX, deltaY);
-        if (!didSwipe && dist < CLICK_MOVE_THRESHOLD_PX) {
+        if (dist < CLICK_MOVE_THRESHOLD_PX) {
           emit('upload-click');
         }
       }
     }
-    // Snap to nearest orb after touch interaction ends
-    startOrbSnap();
+    
+    isVerticalDrag.value = false;
     isUserPressing.value = false;
     touchId1 = null;
     touchPrev1 = null;
@@ -1528,8 +1413,8 @@ function touchEndCallback(event: TouchEvent) {
   if (touch === null) {
     return;
   }
-  // Snap after touch interaction end (non-zero-changed-touches branch)
-  startOrbSnap();
+  // Snap after touch interaction end
+  // (handled by physics)
   isUserPressing.value = false;
   touchId1 = null;
   touchPrev1 = null;
@@ -1538,11 +1423,18 @@ function touchEndCallback(event: TouchEvent) {
 
 function touchCancelCallback() {
   isUserPressing.value = false;
+  isVerticalDrag.value = false;
+  isUserPressing.value = false;
   touchId1 = null;
   touchPrev1 = null;
   touchOrigin1 = null;
   pinchPrevDist = null;
 }
+
+const scrollToOrb = (index: number) => {
+  scrollAnchor.value = index;
+  scrollAnchorVel.value = 0;
+};
 
 onMounted(async () => {
   await nextTick();
@@ -1558,6 +1450,7 @@ onMounted(async () => {
     return;
   }
 
+
   interactionElement.addEventListener('mousedown', (mouseEvent) => {
     // Left mouse button only
     if (mouseEvent.button !== 0) {
@@ -1566,12 +1459,21 @@ onMounted(async () => {
     // Prevent default dragging/selection behavior so drag only controls rotation
     mouseEvent.preventDefault();
     const pos = { x: mouseEvent.clientX, y: mouseEvent.clientY };
+    
+    // Initialize new drag state
+    isVerticalDrag.value = false;
+    hasDragMoved.value = false;
+    dragStartY.value = mouseEvent.clientY;
+    dragStartScrollOffset.value = scrollAnchor.value;
+
+    const targetOrbIndex = getOrbIndexAtPoint(pos);
     const shouldOrbDrag =
       uploadedImageElements.value.length > 0 &&
-      !isOrbTransitioning.value &&
       !isOrbDismissing.value &&
-      isPointInsideCenterOrb(mouseEvent);
+      targetOrbIndex !== -1;
+      
     if (shouldOrbDrag) {
+      activeOrbDragIndex.value = targetOrbIndex;
       orbDragMouseActive = true;
       orbDragMouseStart = pos;
       orbDragLastX = pos.x;
@@ -1579,6 +1481,7 @@ onMounted(async () => {
       mousePrevPosition = null;
       mouseStartPosition = null;
     } else {
+      activeOrbDragIndex.value = null;
       orbDragMouseActive = false;
       orbDragMouseStart = null;
       isOrbDragging.value = false;
@@ -1588,74 +1491,98 @@ onMounted(async () => {
     isUserPressing.value = true;
     scopeRotationVel.value = 0;
     scopeSizeVel.value = 0;
+    scopeSizeVel.value = 0;
+    scrollAnchorVel.value = 0; // Stop existing scroll momentum
   });
+  
   let mousePrevTime = performance.now();
   document.addEventListener('mousemove', (mouseEvent) => {
-    if (orbDragMouseActive && orbDragMouseStart !== null) {
-      // Rotate kaleidoscope incrementally based on horizontal drag delta
-      const now = performance.now();
-      const prevX = orbDragLastX ?? mouseEvent.clientX;
-      const dx = mouseEvent.clientX - prevX;
-      const dt = Math.max(1, now - mousePrevTime);
-      scopeRotation.value += dx / 300;
-      scopeRotationVel.value = clampRotationVelocity((dx / dt) * 0.02);
-      orbDragLastX = mouseEvent.clientX;
-      setOrbDragVisuals(mouseEvent.clientX - orbDragMouseStart.x);
-      mousePrevTime = now;
-      return;
-    }
-    if (mousePrevPosition === null) {
-      return;
-    }
     const now = performance.now();
-    const deltaTime = Math.max(1, now - mousePrevTime);
-    const deltaX = (mouseEvent.clientX - mousePrevPosition.x) / 10;
+    
+    // If not pressing, just return (or if processing other drags)
+    if (!isUserPressing.value) return; 
+    
+    const dt = Math.max(1, now - dragLastTime.value);
+    const dy = mouseEvent.clientY - dragLastY.value;
 
-    scopeRotation.value += deltaX / 35;
-    if (Math.abs(mouseEvent.clientX - mousePrevPosition.x) > 1) {
-      scopeRotationVel.value = clampRotationVelocity((deltaX / deltaTime) * 0.35);
-    } else {
-      scopeRotationVel.value = 0;
+    // 1:1 Direct Vertical Drag
+    const totalDragY = mouseEvent.clientY - dragStartY.value;
+    const progressDelta = -totalDragY / ORB_SPACING;
+    scrollAnchor.value = dragStartScrollOffset.value + progressDelta;
+    
+    // Update velocity for momentum
+    scrollAnchorVel.value = (-dy / ORB_SPACING) / (dt / 1000); // units per sec
+    
+    // 2. Horizontal Drag (Rotation / Dismiss) - Only if dragging a specific orb
+    if (orbDragMouseActive && orbDragMouseStart !== null && activeOrbDragIndex.value !== null) {
+      const index = activeOrbDragIndex.value;
+      const orb = orbs.value[index];
+      if (orb) {
+          // Rotate kaleidoscope incrementally based on horizontal drag delta
+          const prevX = orbDragLastX ?? mouseEvent.clientX;
+          const dx = mouseEvent.clientX - prevX;
+          const dtMove = Math.max(1, now - mousePrevTime);
+          
+          orb.rotation += dx / 300;
+          orb.rotationVel = clampRotationVelocity((dx / dtMove) * 0.02);
+          
+          orbDragLastX = mouseEvent.clientX;
+          setOrbDragVisuals(mouseEvent.clientX - orbDragMouseStart.x);
+          mousePrevTime = now;
+      }
     }
-
+    
+    hasDragMoved.value = true;
+    
+    // Background interaction? (mousePrevPosition is not null)
     mousePrevPosition = {
       x: mouseEvent.clientX,
       y: mouseEvent.clientY,
     };
     mousePrevTime = now;
+    // Keep drag tracker updated for consistency
+    dragLastY.value = mouseEvent.clientY;
+    dragLastTime.value = now;
   });
+  
   document.addEventListener('mouseup', (mouseEvent: MouseEvent) => {
+    
+    // Unified Mouse Up Logic
+    
+    // Check dismiss / bounce for active orb
     if (orbDragMouseActive && orbDragMouseStart !== null) {
       const deltaX = mouseEvent.clientX - orbDragMouseStart.x;
       const threshold = getCenterOrbDismissThresholdPx();
       const direction: 1 | -1 = deltaX >= 0 ? 1 : -1;
-      const removeIndex = centerSlotIndex.value;
+      
+      const draggedIndex = activeOrbDragIndex.value ?? -1;
+      activeOrbDragIndex.value = null;
 
       orbDragMouseActive = false;
       orbDragMouseStart = null;
       isOrbDragging.value = false;
-
-      if (Math.abs(deltaX) >= threshold && uploadedImageElements.value.length > 0) {
-        void dismissActiveOrb(direction, removeIndex);
+      
+      if (Math.abs(deltaX) >= threshold && uploadedImageElements.value.length > 0 && draggedIndex !== -1) {
+        void dismissActiveOrb(direction, draggedIndex);
       } else {
-        resetOrbDragVisuals();
+        // Reset drag visuals with bounce back
+        if (draggedIndex !== -1) {
+           void bounceBackOrb(draggedIndex);
+        }
       }
-
-      isUserPressing.value = false;
-      return;
+    } else if (mouseStartPosition !== null) {
+      // Background click check
+      const deltaX = mouseEvent.clientX - mouseStartPosition.x;
+      const deltaY = mouseEvent.clientY - mouseStartPosition.y;
+      const dist = Math.hypot(deltaX, deltaY);
+      
+      if (dist < CLICK_MOVE_THRESHOLD_PX) {
+        emit('upload-click');
+      }
     }
-    if (mousePrevPosition === null || mouseStartPosition === null) {
-      return;
-    }
-    const deltaX = mouseEvent.clientX - mouseStartPosition.x;
-    const deltaY = mouseEvent.clientY - mouseStartPosition.y;
-    const dist = Math.hypot(deltaX, deltaY);
-    const didSwipe = handleSwipeGesture(deltaX, deltaY);
-    if (!didSwipe && dist < CLICK_MOVE_THRESHOLD_PX) {
-      emit('upload-click');
-    }
-    // Snap to nearest orb after mouse interaction ends
-    startOrbSnap();
+    
+    // Cleanup shared state
+    isVerticalDrag.value = false;
     isUserPressing.value = false;
     mousePrevPosition = null;
     mouseStartPosition = null;
@@ -1670,21 +1597,8 @@ onMounted(async () => {
     const isTrackpad = wheelEvent.deltaMode === 0;
     // Compute impulse from raw delta (single mapping, nonlinear)
     const progressDelta = computeImpulseFromDelta(clampedDelta, isTrackpad);
-    // Track last wheel delta to detect fast flicks (use raw clamped value)
-    try {
-      orbLastWheelDelta = clampedDelta;
-    } catch {
-      // silent
-    }
-    applyOrbScrollDelta(progressDelta);
-    // Snap after a short pause in wheel activity
-    if (orbSnapTimeout !== null) {
-      clearTimeout(orbSnapTimeout);
-    }
-    orbSnapTimeout = window.setTimeout(() => {
-      orbSnapTimeout = null;
-      startOrbSnap();
-    }, 150);
+    // Apply to physics
+    applyPhysicsScrollImpulse(progressDelta);
   }, { passive: false });
 
   // Use non-passive touch listeners so preventDefault() in handlers stops page scrolling
@@ -1756,7 +1670,12 @@ onMounted(async () => {
     const dt = Math.max(1, now - lastWindowScrollTime); // ms
     // dy/dt = px per ms; scale to a gentle rotation velocity impulse
     const velocityImpulse = (dy / dt) * SCROLL_ROTATION_SCALE;
-    scopeRotationVel.value = clampRotationVelocity(scopeRotationVel.value + velocityImpulse);
+    
+    // Apply global scroll impulse to all orbs
+    orbs.value.forEach(orb => {
+        orb.rotationVel = clampRotationVelocity(orb.rotationVel + velocityImpulse);
+    });
+    
     lastWindowScrollY = window.scrollY;
     lastWindowScrollTime = now;
   };
@@ -1787,9 +1706,7 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
     if (pendingOrbRemovalIndex.value !== null && removedIndex === pendingOrbRemovalIndex.value) {
       pendingOrbRemovalIndex.value = null;
       if (newImages.length > 0) {
-        syncSlotIndices();
-        orbTransitionProgress.value = 0.0;
-        isOrbTransitioning.value = false;
+        // Physics handles gap fill automatically
         return;
       }
     }
@@ -1805,11 +1722,9 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
     await loadUploadedImages(newImages);
   } else {
     uploadedImageElements.value = [];
+    orbs.value = [];
     activeImageIndex.value = 0;
-    orbScrollOffset.value = 0;
-    syncSlotIndices();
-    orbTransitionProgress.value = 0.0;
-    isOrbTransitioning.value = false;
+    scrollAnchor.value = 0;
     // Restart camera if no images are uploaded
     const camera = document.getElementById('camera') as HTMLVideoElement | null;
     if (camera && !cameraStream) {
@@ -1839,53 +1754,43 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
   <div class="w-[100dvw] h-[100dvh] relative overflow-hidden">
     <div
       ref="interaction-layer"
-      class="absolute inset-0 z-20 touch-none select-none"
+      class="absolute inset-0 z-[200] touch-none select-none"
     />
-    <!-- Incoming orb (offscreen, moves into top or bottom small orb) -->
-    <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
-      :style="getOrbStyle('incoming')"
-      aria-hidden="true"
+
+    <!-- Dynamic Orbs List -->
+    <div 
+       v-for="orb in orbs" 
+       :key="orb.id"
+       class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
+       :style="getOrbStyle(orb)"
     >
-      <canvas
-        ref="display-canvas-incoming"
-        class="block w-full h-full object-cover"
-      />
-    </div>
-    <!-- Top orb (bottom hemisphere visible) -->
-    <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
-      :style="getOrbStyle('top')"
-      aria-hidden="true"
-    >
-      <canvas
-        ref="display-canvas-top"
-        class="block w-full h-full object-cover"
-      />
+       <canvas
+          :ref="(el) => setCanvasRef(el, orb.id)"
+          class="block w-full h-full object-cover"
+       />
     </div>
 
-    <!-- Center orb (full) -->
+    <!-- Grid Gallery -->
     <div
-      ref="center-orb"
-      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-10 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
-      :style="getCenterOrbStyle()"
+       v-if="orbs.length > 0"
+       class="absolute left-1/2 w-[90vw] max-w-md grid grid-cols-3 gap-3 p-4 transition-all duration-500 ease-out"
+       :style="{
+          top: '50%',
+          transform: `translate(-50%, -50%) translateY(${(orbs.length - scrollAnchor) * ORB_SPACING}px)`,
+          opacity: Math.max(0, 1 - Math.abs((orbs.length - scrollAnchor) * 0.5))
+       }"
     >
-      <canvas
-        ref="display-canvas-center"
-        class="block w-full h-full object-cover"
-      />
-    </div>
-
-    <!-- Bottom orb (top hemisphere visible) -->
-    <div
-      class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 z-0 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
-      :style="getOrbStyle('bottom')"
-      aria-hidden="true"
-    >
-      <canvas
-        ref="display-canvas-bottom"
-        class="block w-full h-full object-cover"
-      />
+       <div 
+         v-for="(orb, index) in orbs" 
+         :key="orb.id + '-thumb'"
+         class="relative aspect-square rounded-full overflow-hidden cursor-pointer hover:scale-105 active:scale-95 transition-transform bg-neutral-800 border-2 border-neutral-700"
+         @click.stop="scrollToOrb(index)"
+       >
+          <canvas
+             :ref="(el) => setGridCanvasRef(el, orb.id)"
+             class="block w-full h-full object-cover"
+          />
+       </div>
     </div>
 
     <!-- Hidden WebGL canvas used as source -->
