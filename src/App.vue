@@ -16,6 +16,18 @@ type RemovedImage = { image: string; index: number };
 const undoStack = ref<RemovedImage[]>([]);
 const canUndo = computed(() => undoStack.value.length > 0);
 
+const isOnGallery = ref(false);
+const activeOrbsCount = ref(0);
+const hasGalleryItems = computed(() => undoStack.value.length > 0 || uploadedImages.value.length > 0);
+
+const handleGalleryViewChange = (onGallery: boolean) => {
+  isOnGallery.value = onGallery;
+};
+
+const handleActiveOrbsChange = (count: number) => {
+  activeOrbsCount.value = count;
+};
+
 function savedFrame(objectUrl: string) {
   saveNextFrame.value = false;
   showCapture.value = true;
@@ -91,26 +103,32 @@ window.addEventListener('keypress', (keyEvent) => {
     @save-frame="savedFrame"
     @upload-click="handleUploadClick"
     @remove-uploaded-image="handleRemoveUploadedImage"
+    @gallery-view-change="handleGalleryViewChange"
+    @active-orbs-change="handleActiveOrbsChange"
   />
 
   <button
-    v-if="canUndo"
+    v-if="canUndo && !isOnGallery"
     type="button"
-    class="fixed left-3 top-3 z-[300] rounded-full bg-black/70 text-white text-xs px-3 py-1.5 shadow-md backdrop-blur-sm hover:bg-black/85 active:scale-95 transition"
+    class="fixed left-1 top-1 z-[300] text-black active:scale-95 transition hover:opacity-70 p-4 cursor-pointer"
     @click.stop="undoLastRemoval"
+    aria-label="Undo"
   >
-    Undo
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 14 4 9l5-5"/>
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"/>
+    </svg>
   </button>
   <div
-    v-if="!showCapture && uploadedImages.length === 0"
-    class="fixed left-1/2 pointer-events-none z-10 min-w-[200px] min-h-[200px] w-[80vmin] h-[80vmin] -translate-x-1/2 -translate-y-1/2 flex items-center justify-center"
+    v-if="!showCapture && activeOrbsCount === 0 && !hasGalleryItems"
+    class="fixed left-1/2 pointer-events-none z-10 min-w-[200px] min-h-[200px] w-[60vmin] h-[60vmin] -translate-x-1/2 -translate-y-1/2 flex items-center justify-center rounded-full border-2 border-black"
     style="top: 50%"
     aria-hidden="true"
   >
     <img
       src="/upload.svg"
       alt=""
-      class="w-12 h-12 sm:w-14 sm:h-14 opacity-70 dark:opacity-60 select-none"
+      class="w-12 h-12 sm:w-14 sm:h-14 select-none brightness-0"
     >
   </div>
   <input

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted} from 'vue';
+import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted, computed} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
@@ -9,7 +9,7 @@ const props = defineProps<{
   uploadedImages?: string[]
 }>();
 
-const emit = defineEmits(['save-frame', 'upload-click', 'remove-uploaded-image']);
+const emit = defineEmits(['save-frame', 'upload-click', 'remove-uploaded-image', 'gallery-view-change', 'active-orbs-change']);
 
 const CLICK_MOVE_THRESHOLD_PX = 10;
 
@@ -20,7 +20,7 @@ const scopeRotation = ref(0.0);
 // Independent rotations for each orb (legacy refs kept for compatibility until full physics migration)
 const scopeRotationTop = ref(0.0);
 const scopeRotationBottom = ref(0.0);
-const scopeSize = ref(1);
+const scopeSize = ref(0.8);
 const scopeRotationTopVel = ref(0.0);
 const scopeRotationBottomVel = ref(0.0);
 const scopeOffset = ref([0.0, 0.0]);
@@ -60,10 +60,30 @@ interface OrbState {
   vy: number;
   scale: number;
   rotation: number;
+  rotation: number;
   rotationVel: number;
+  texture: WebGLTexture | null;
+  galleryId: string; // Link to persistent gallery item
 }
 
+interface GalleryItem {
+  id: string;
+  src: string;
+  img?: HTMLImageElement; // Keep ref for baking
+  thumbnailSrc?: string; // Baked kaleidoscope preview
+  originalSrc: string; // Keep original reference
+  status: 'active' | 'left' | 'right';
+}
+
+// Global helper to bake thumbnails (assigned in main)
+let bakeKaleidoscopeThumbnail: ((img: HTMLImageElement, zoomLevel?: 'in' | 'out') => string) | null = null;
+
+// Global GL context for shared access
+let gl: WebGLRenderingContext | null = null;
+
+
 const orbs = ref<OrbState[]>([]);
+const galleryItems = ref<GalleryItem[]>([]);
 // Global scroll anchor (target position for index 0)
 // We treat "1 unit" of scroll as "one orb height + gap"
 const scrollAnchor = ref(0);
@@ -71,27 +91,69 @@ const scrollAnchorVel = ref(0);
 
 // Physics Constants
 // Physics Constants
-const ORB_HEIGHT_PX = Math.max(300, Math.min(window.innerWidth, window.innerHeight) * 0.64); // Match visual size (64vmin)
+// Physics Constants
+const ORB_HEIGHT_PX = ref(0); 
 const ORB_SPRING_STIFFNESS = 120;
 const ORB_SPRING_DAMPING = 20; // Critical damping ~ sqrt(4*k) -> sqrt(480) ~ 22. So 20 is slightly underdamped.
-const ORB_GAP_PX = 50; // Increased gap (reduced from 400)
-const ORB_SPACING = ORB_HEIGHT_PX + ORB_GAP_PX;
+const ORB_GAP_PX = ref(0); 
+const ORB_SPACING = ref(0);
+
+// Target Locking Physics
+const scrollTarget = ref<number | null>(null);
+// SCROLL_BREAKTHROUGH_VELOCITY replaced by debugBreakthroughVel
+const SCROLL_PREDICTION_FACTOR = 0.3; // How far ahead to look for target
+// SCROLL_SNAP_TENSION replaced by debugSpringTension
+// SCROLL_SNAP_FRICTION replaced by debugSpringFriction
+const WHEEL_LOCK_TIMEOUT_MS = 150; // Delay after wheel stops to lock target
+
+const updateLayout = () => {
+    // The requirement: "half hemisphere of the smaller orbs above/below should be visible"
+    // This implies that the spacing between orb centers should be half the viewport height.
+    // So if the center orb is at 0, the next one is at +window.innerHeight/2.
+    // This places the center of the next orb exactly at the bottom edge of the screen.
+    
+    // We update the reactive constants
+    const vh = window.innerHeight;
+    const spacing = vh * 0.5; // distance between centers
+    
+    ORB_SPACING.value = spacing;
+    
+    // ORB_HEIGHT_PX is used for visual sizing logic in some places, 
+    // keep consistent with the visual CSS (64vmin)
+    const vmin = Math.min(window.innerWidth, window.innerHeight);
+    const visualSize = Math.max(160, vmin * 0.64);
+    ORB_HEIGHT_PX.value = visualSize;
+    
+    // Gap is just derived
+    ORB_GAP_PX.value = ORB_SPACING.value - ORB_HEIGHT_PX.value;
+};
 
 // Mapping: scrollAnchor = 0 -> orb[0] is at center
 // scrollAnchor = 1 -> orb[1] is at center (orb[0] moves up)
+// Physics & Debug State
+// Physics tuning parameters
+const debugMaxImpulse = ref(4.0);
+const debugBreakthroughVel = ref(10.0);
+const debugExcessCost = ref(4.0);
+const debugSpringTension = ref(300.0);
+const debugSpringFriction = ref(48.0);
+const debugExcessExp = ref(2.0);
+const debugFlickMultiplier = ref(1.0);
+const debugSnapbackThreshold = ref(1.0);
+
 // Simplified impulse mapping parameters (single mapping for wheel/trackpad/touch)
 const ORB_WHEEL_DELTA_MAX = 120; // clamp reference for raw wheel delta
-const ORB_MAX_IMPULSE = 3.0; // max impulse (progress units) for strongest flick
-const ORB_IMPULSE_EXP = 1.2; // nonlinear exponent (>1 makes large deltas grow faster)
+// ORB_MAX_IMPULSE replaced by debugMaxImpulse
+const ORB_IMPULSE_EXP = 1.8; // nonlinear exponent (>1 makes large deltas grow faster)
 const ORB_TRACKPAD_SCALE = 0.9; // slight device scale for trackpad
-const ORB_FRICTION = 10; // lower = less friction (was 8)
+const ORB_FRICTION = 3.0; // lower = less friction (was 8)
 const ORB_VELOCITY_THRESHOLD = 1.2;
 const ORB_MAX_VELOCITY = 20;
 const maxRotationSpeed = 1; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
 // Scroll -> rotation mapping: scale factor applied to scroll velocity (px/ms) to rotation velocity
-const SCROLL_ROTATION_SCALE = 0.02;
+const SCROLL_ROTATION_SCALE = 0.003;
 // Track last window scroll position/time to compute scroll velocity
 let lastWindowScrollY = 0;
 let lastWindowScrollTime = performance.now();
@@ -135,6 +197,28 @@ const clampScopeSizeVelocity = (velocity: number): number => {
 };
 let texture1: WebGLTexture | null = null;
 let texture2: WebGLTexture | null = null;
+
+// Helper to create texture from image
+const createTextureFromImage = (img: HTMLImageElement): WebGLTexture | null => {
+  if (!gl) return null;
+  const tex = gl.createTexture();
+  if (!tex) return null;
+  
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // Upload the image into the texture.
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  
+  // Set the structural parameters.
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  
+  // Unbind
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  return tex;
+};
 
 const canvasRefs = ref<Record<string, HTMLCanvasElement>>({});
 const setCanvasRef = (el: any, id: string) => {
@@ -198,7 +282,7 @@ const computeImpulseFromDelta = (rawDelta: number, isTrackpad: boolean) => {
   const absClamped = Math.min(ORB_WHEEL_DELTA_MAX, Math.abs(rawDelta));
   const normalized = absClamped / ORB_WHEEL_DELTA_MAX; // 0..1
   const scaled = Math.pow(normalized, ORB_IMPULSE_EXP);
-  const base = scaled * ORB_MAX_IMPULSE;
+  const base = scaled * debugMaxImpulse.value;
   const deviceScale = isTrackpad ? ORB_TRACKPAD_SCALE : 1;
   return sign * base * deviceScale;
 };
@@ -223,7 +307,7 @@ const getOrbStyle = (orb: OrbState) => {
   const dist = Math.abs(orb.y);
   // Scale ends at 0.5 (half size) when distance is >= ORB_SPACING
   // Scale is 1.0 at distance 0
-  const distRatio = Math.min(1.0, dist / ORB_SPACING);
+  const distRatio = Math.min(1.0, dist / ORB_SPACING.value);
   const scaleFactor = 1.0 - (0.5 * distRatio); // properties: at 0 -> 1.0. at 1 -> 0.5.
   
   const visualScale = orb.scale * scaleFactor;
@@ -283,15 +367,46 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
       // Initialize orb state
       // Initial position: stacked vertically based on index
       // Target position will be calculated in the physics loop
+      // Reconcile with gallery items
+      let galleryId = '';
+      const existingItem = galleryItems.value.find(item => item.src === src && item.status === 'active' && !loadedOrbs.some(o => o.galleryId === item.id));
+      
+      if (existingItem) {
+        galleryId = existingItem.id;
+      } else {
+        galleryId = `gallery-${Date.now()}-${index}`;
+        
+        // Generate baked thumbnail if possible (normal size for active items)
+        let thumb = undefined;
+        if (bakeKaleidoscopeThumbnail) {
+             try {
+                thumb = bakeKaleidoscopeThumbnail(resizedImg, 'in');
+             } catch (e) {
+                console.error("Failed to bake thumbnail", e);
+             }
+        }
+        
+        galleryItems.value.push({
+          id: galleryId,
+          src: src,
+          img: resizedImg, 
+          thumbnailSrc: thumb,
+          originalSrc: src,
+          status: 'active'
+        });
+      }
+
       loadedOrbs.push({
         id: `orb-${Date.now()}-${index}`,
         img: resizedImg,
         x: 0,
-        y: index * ORB_SPACING, // Initial placement
+        y: index * ORB_SPACING.value, // Initial placement
         vy: 0,
         scale: 1,
         rotation: 0,
-        rotationVel: 0
+        rotationVel: 0,
+        texture: createTextureFromImage(resizedImg),
+        galleryId: galleryId
       });
       index++;
     }
@@ -317,6 +432,49 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
     activeImageIndex.value = 0;
     scrollAnchor.value = 0;
   }
+};
+
+const resolveScrollTarget = () => {
+    const current = scrollAnchor.value;
+    const velocity = scrollAnchorVel.value;
+    const mag = Math.abs(velocity);
+    const sign = Math.sign(velocity) || 1;
+    
+    // Always calculate a target if we have velocity
+    if (mag > 0.01) {
+        // SNAPBACK ZONE: If velocity is too low, don't leave the current orb.
+        // This creates the "magnetic" pull feeling.
+        if (mag < debugSnapbackThreshold.value) {
+             scrollTarget.value = Math.max(0, Math.min(orbs.value.length + 1, Math.round(current)));
+             return; 
+        }
+
+        // Fling / Scroll Command: Just go to the next/nearest orb in direction of travel
+        // We ignore debugBreakthroughVel and steps logic to ensure we only go to the "next one"
+        const steps = 1;
+        
+        // Sticky Base: The "next" orb in direction of travel
+        // If sign > 0 (scrolling down), base is floor(current)
+        // If sign < 0 (scrolling up), base is ceil(current)
+        const base = sign > 0 ? Math.floor(current) : Math.ceil(current);
+        let target = base + steps * sign;
+        
+        // Skip position orbs.length in both directions - go directly to/from gallery
+        if (target === orbs.value.length) {
+            // Scrolling down from last orb -> skip to gallery
+            target = sign > 0 ? orbs.value.length + 1 : orbs.value.length - 1;
+        }
+        
+        scrollTarget.value = Math.max(0, Math.min(orbs.value.length + 1, target));
+
+        // Velocity dampening: limit velocity so the spring settles quickly without large overshoot
+        if (Math.abs(scrollAnchorVel.value) > 6.0) {
+            scrollAnchorVel.value = sign * 6.0;
+        }
+    } else {
+        // If almost stopped, snap to absolute nearest
+        scrollTarget.value = Math.max(0, Math.min(orbs.value.length + 1, Math.round(current)));
+    }
 };
 
 async function main(canvasElement: HTMLCanvasElement) {
@@ -355,8 +513,23 @@ async function main(canvasElement: HTMLCanvasElement) {
   }
 
   // Canvas with WebGL context (element passed from template ref so it exists when mounted)
-  const canvasSize = Math.max(1024, window.innerWidth, window.innerHeight) * window.devicePixelRatio;
-  const gl = canvasElement.getContext('webgl')!;
+  // Optimize: match canvas size to the visual orb size (64vmin), not the restart of the screen.
+  // Also cap pixel ratio to 2.0 to avoid excessive overhead on high-DPI mobile screens.
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.0);
+  const vmin = Math.min(window.innerWidth, window.innerHeight);
+  // 64vmin is the CSS size. We add a bit of buffer for safety/quality, but not full screen.
+  // 0.64 * vmin * dpr. 
+  // Let's cap it at 1024 to be safe, but usually it will be smaller on mobile.
+  // e.g. iPhone width 400 * 0.64 * 3 = 768. 
+  // Full screen was ~3000px.
+  const orbVisualSize = Math.round(vmin * 0.64 * dpr);
+  const canvasSize = Math.max(800, orbVisualSize); // minimal quality baseline 800
+  
+  gl = canvasElement.getContext('webgl', { alpha: false, antialias: false, depth: false })!; // Optimize context attributes
+  if (!gl) {
+    console.error('WebGL not supported');
+    return;
+  }
   canvasElement.width = canvasElement.height = canvasSize;
   gl.viewport(0, 0, canvasElement.width, canvasElement.height);
 
@@ -869,7 +1042,8 @@ async function main(canvasElement: HTMLCanvasElement) {
   const drawOrbFrame = (
     displayCanvas: HTMLCanvasElement | null,
     imageSource: HTMLImageElement | HTMLVideoElement,
-    scopeScaleMultiplier: number
+    scopeScaleMultiplier: number,
+    cachedTexture: WebGLTexture | null = null
   ) => {
     const isVideo = imageSource instanceof HTMLVideoElement;
     const imageWidth = isVideo ? imageSource.videoWidth : imageSource.width;
@@ -878,20 +1052,89 @@ async function main(canvasElement: HTMLCanvasElement) {
       return;
     }
 
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageSource);
+    gl!.activeTexture(gl!.TEXTURE0);
+    gl!.bindTexture(gl!.TEXTURE_2D, texture1); // Bind unit 0
+    
+    // Use cached texture if available
+    if (cachedTexture) {
+         // If we have a cached texture, we must bind IT to the active texture unit.
+         // Wait, texture1 is the unit 0 texture...
+         // Actually, we should bind cachedTexture INSTEAD of texture1 if it exists.
+         gl!.bindTexture(gl!.TEXTURE_2D, cachedTexture);
+    } else {
+         gl!.bindTexture(gl!.TEXTURE_2D, texture1);
+         gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA, gl!.RGBA, gl!.UNSIGNED_BYTE, imageSource);
+    }
 
-    gl.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
+    gl!.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
     gl.uniform2f(dataDimensions2Bind, imageWidth, imageHeight);
     gl.uniform1f(dataZoomBind, cameraZoom.value);
     gl.uniform1f(scopeSizeBind, scopeSize.value * scopeScaleMultiplier);
     if (transitionProgressBind) {
       gl.uniform1f(transitionProgressBind, 0.0);
     }
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    renderToDisplayCanvas(displayCanvas, canvasElement);
+    // Draw call
+    gl!.drawArrays(gl.TRIANGLES, 0, 6);
+    
+    // If displayCanvas provided, copy to it. If null, we just drew to the main framebuffer (gl context).
+    if (displayCanvas) {
+        renderToDisplayCanvas(displayCanvas, canvasElement);
+    }
   };
+
+  // Implement the baker
+  bakeKaleidoscopeThumbnail = (img: HTMLImageElement, zoomLevel: 'in' | 'out' = 'out') => {
+      // 1. Temporarily bind texture
+      const tex = gl!.createTexture();
+      setupTexture(tex);
+      gl!.activeTexture(gl!.TEXTURE0); // Use unit 0
+      gl!.bindTexture(gl!.TEXTURE_2D, tex);
+      gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA, gl!.RGBA, gl!.UNSIGNED_BYTE, img);
+      
+      // 2. Render to main canvas (hidden)
+      // Use standard settings for uniformity in gallery
+      // Zoom levels: 'out' = LARGER scopeSize = fewer reflections (clearer), 'in' = normal scopeSize
+      const baseScopeSize = scopeSize.value;
+      const zoomedScopeSize = zoomLevel === 'out' ? baseScopeSize * 2.0 : baseScopeSize;
+      
+      gl!.uniform2f(dataDimensionsBind, img.width, img.height);
+      gl!.uniform2f(dataDimensions2Bind, img.width, img.height);
+      gl!.uniform1f(dataZoomBind, 1.0); // Reset zoom for thumbnail
+      gl!.uniform1f(scopeSizeBind, zoomedScopeSize);
+      gl!.uniform1f(scopeRotationBind, 0.0); // Standardize rotation
+      gl!.uniform1f(transitionProgressBind, 0.0);
+      
+      gl!.drawArrays(gl.TRIANGLES, 0, 6);
+      
+      // 3. Capture and resize
+      // The main canvas might be huge. We want a small thumb.
+      const thumbSize = 200;
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = thumbSize;
+      tempCanvas.height = thumbSize;
+      const tCtx = tempCanvas.getContext('2d');
+      if (tCtx) {
+          tCtx.drawImage(canvasElement, 0, 0, canvasElement.width, canvasElement.height, 0, 0, thumbSize, thumbSize);
+          // Cleanup
+          gl!.deleteTexture(tex);
+          // Resizing to small prevents massive base64 strings
+          return tempCanvas.toDataURL('image/jpeg', 0.8);
+      }
+      
+      gl!.deleteTexture(tex);
+      return canvasElement.toDataURL('image/jpeg', 0.8);
+  };
+  
+  // Bake any pending items (from initial load)
+  galleryItems.value.forEach(item => {
+     if (!item.thumbnailSrc && item.img) {
+         try {
+            item.thumbnailSrc = bakeKaleidoscopeThumbnail!(item.img, 'in');
+         } catch (e) {
+            console.error("Failed to bake pending thumbnail", e);
+         }
+     }
+  });
 
 
   // setCanvasRef definition removed from here (moved to top level)
@@ -906,60 +1149,30 @@ async function main(canvasElement: HTMLCanvasElement) {
     // 1. Scroll Anchor Physics
     
     // Bounds (Rubber Band targets)
-    // Add +1 slot for the grid gallery at the bottom
-    const maxScroll = Math.max(0, orbs.value.length);
+    // Add +1 slot for the grid gallery at the end
+    const maxScroll = Math.max(0, orbs.value.length + 1);
     let target = null; // If non-null, we spring towards this
 
     if (!isUserPressing.value) {
-       // A. Out of Bounds -> strong snap back
-       if (scrollAnchor.value < -0.01) {
-          target = 0;
-       } else if (scrollAnchor.value > maxScroll + 0.01) {
-          target = maxScroll;
-       } 
-       // B. In Bounds -> Friction or Snap
-       else {
-          // If velocity is high, just apply simple friction ("Free Glide")
-          // If velocity is low, OR we are very close to a snap point, engage snap.
-          
-          // "Capture" threshold: slowing down enough to pick a parking spot.
-          // Units are "orbs per second". 2.0 is moderate speed.
-          const isSlowEnoughToSnap = Math.abs(scrollAnchorVel.value) < 2.0;
-          
-          if (isSlowEnoughToSnap) {
-             // Predictive snap: where would we land if we coasted?
-             // Simple prediction: snap to nearest integer in direction of travel, or just nearest integer.
-             // Adding a small lookahead (velocity * 0.15) helps feel "responsive" to the fling.
-             const predictedPos = scrollAnchor.value + scrollAnchorVel.value * 0.15;
-             target = Math.round(predictedPos);
-          } else {
-             // Free Glide with Friction
-             // Exponential decay friction
-             const frictionCoeff = 3.0; // Higher = stops faster
-             scrollAnchorVel.value *= Math.exp(-frictionCoeff * dt);
-          }
-       }
+       // Bounds logic handled by target clamping in resolveScrollTarget
+       // Here we just spring towards scrollTarget if it exists
        
-       // If we have a target, apply Spring-Damper physics
-       if (target !== null) {
-          const dist = target - scrollAnchor.value;
-          
-          // Tuned Spring Constants for "Crisp" feel
-          const tension = 180.0;
-          const friction = 26.0; // Critical damping is ~ 2 * sqrt(tension) ≈ 2 * 13.4 ≈ 27
-          
-          const force = dist * tension - scrollAnchorVel.value * friction;
-          scrollAnchorVel.value += force * dt;
+       if (scrollTarget.value !== null) {
+           const dist = scrollTarget.value - scrollAnchor.value;
+           const force = dist * debugSpringTension.value - scrollAnchorVel.value * debugSpringFriction.value;
+           scrollAnchorVel.value += force * dt;
+       } else {
+           // We are in a "floating" state (e.g. wheel is active but hasn't timed out), 
+           // just apply some friction so we don't drift forever
+           scrollAnchorVel.value *= Math.exp(-3.0 * dt);
        }
        
        // Update position
        scrollAnchor.value += scrollAnchorVel.value * dt;
 
     } else {
-       // User is pressing -> Direct control (velocity is tracked in handlers), just update pos?
-       // Actually handlers update scrollAnchor directly for 1:1 feel, 
-       // but we tracked velocity for the release throw.
-       // So here we do nothing to scrollAnchor.
+       // User is pressing -> clear target
+       scrollTarget.value = null;
     }
 
     // 2. Orb Physics & Rendering (Moved Rotation Physics here)
@@ -974,7 +1187,7 @@ async function main(canvasElement: HTMLCanvasElement) {
         const orb = orbs.value[i];
         
         // Target Y Position
-        const targetY = (i - scrollAnchor.value) * ORB_SPACING;
+        const targetY = (i - scrollAnchor.value) * ORB_SPACING.value;
         
         // Spring Force for Position
         const dist = targetY - orb.y;
@@ -1034,7 +1247,7 @@ async function main(canvasElement: HTMLCanvasElement) {
              const proximity = Math.max(0, 1 - dist / 400); // 0..1
              const scaleEffect = 1 + proximity * 0.2;
              
-             drawOrbFrame(displayCanvas, source ?? cameraFallback, getOrbScopeScale('center') * scaleEffect); 
+             drawOrbFrame(displayCanvas, source ?? cameraFallback, getOrbScopeScale('center') * scaleEffect, orb.texture); 
         }
     });
 
@@ -1051,10 +1264,10 @@ async function main(canvasElement: HTMLCanvasElement) {
             const gridCanvas = gridCanvasRefs.value[orb.id];
             if (gridCanvas) {
                 const source = getReadySource(orb.img, cameraFallback);
-                gl.uniform1f(scopeRotationBind, orb.rotation);
-                gl.uniform1f(rotationVelocityBind, orb.rotationVel);
+                gl!.uniform1f(scopeRotationBind, orb.rotation);
+                gl!.uniform1f(rotationVelocityBind, orb.rotationVel);
                 // No extra scale effect for grid items
-                drawOrbFrame(gridCanvas, source ?? cameraFallback, 1.0);
+                drawOrbFrame(gridCanvas, source ?? cameraFallback, 1.0, orb.texture);
             }
         });
     }
@@ -1197,6 +1410,22 @@ const dismissActiveOrb = async (direction: 1 | -1, removeIndex: number) => {
      await new Promise(r => requestAnimationFrame(r));
   }
   
+  // Update Gallery Status
+  // Find the gallery item
+  const galleryItem = galleryItems.value.find(item => item.id === orb.galleryId);
+  if (galleryItem) {
+    galleryItem.status = direction === 1 ? 'right' : 'left';
+    
+    // Rebake thumbnail for both swipes (larger scope size for clearer view)
+    if (galleryItem.img && bakeKaleidoscopeThumbnail) {
+      try {
+        galleryItem.thumbnailSrc = bakeKaleidoscopeThumbnail(galleryItem.img, 'out');
+      } catch (e) {
+        console.error('Failed to rebake thumbnail for swipe', e);
+      }
+    }
+  }
+
   // Remove
   pendingOrbRemovalIndex.value = removeIndex;
   removeUploadedImageAtIndex(removeIndex);
@@ -1212,7 +1441,23 @@ const removeUploadedImageAtIndex = (index: number) => {
   // Remove from arrays
   uploadedImageElements.value.splice(index, 1);
   if (index < orbs.value.length) {
+     const removedOrb = orbs.value[index];
+     if (removedOrb.texture && gl) {
+        gl.deleteTexture(removedOrb.texture);
+     }
      orbs.value.splice(index, 1);
+  }
+
+  // Adjust scroll position if we removed an item *above* our current view
+  // This keeps the "current" item in view (which has now shifted index by -1)
+  if (scrollAnchor.value > index) {
+      scrollAnchor.value = Math.max(0, scrollAnchor.value - 1);
+  }
+  
+  // Also adjust the target if it exists, so we don't snap back to the "old" index 
+  // (which is now the next item)
+  if (scrollTarget.value !== null && scrollTarget.value > index) {
+      scrollTarget.value = Math.max(0, scrollTarget.value - 1);
   }
   
   if (activeImageIndex.value >= uploadedImageElements.value.length) {
@@ -1305,11 +1550,11 @@ function touchMoveCallback(event: TouchEvent) {
 
     // 1. Vertical Drag (Scroll)
     const totalDragY = touch.clientY - dragStartY.value;
-    const progressDelta = -totalDragY / ORB_SPACING; // Up drag (negative Y) -> Positive scroll
+    const progressDelta = -totalDragY / ORB_SPACING.value; // Up drag (negative Y) -> Positive scroll
     scrollAnchor.value = dragStartScrollOffset.value + progressDelta;
     
     // Update velocity for momentum (using immediate dy for responsiveness)
-    scrollAnchorVel.value = (-dy / ORB_SPACING) / (dt / 1000); 
+    scrollAnchorVel.value = (-dy / ORB_SPACING.value) / (dt / 1000); 
 
     // 2. Horizontal Drag (Rotation / Dismiss) - Only if dragging a specific orb
     if (orbDragTouchActive && activeOrbDragIndex.value !== null) {
@@ -1419,6 +1664,9 @@ function touchEndCallback(event: TouchEvent) {
   touchId1 = null;
   touchPrev1 = null;
   touchOrigin1 = null;
+  
+  // Engage Target Locking
+  resolveScrollTarget();
 }
 
 function touchCancelCallback() {
@@ -1436,6 +1684,14 @@ const scrollToOrb = (index: number) => {
   scrollAnchorVel.value = 0;
 };
 
+const scrollToGalleryItem = (item: GalleryItem) => {
+  if (item.status !== 'active') return;
+  const index = orbs.value.findIndex(o => o.galleryId === item.id);
+  if (index !== -1) {
+    scrollToOrb(index);
+  }
+};
+
 onMounted(async () => {
   await nextTick();
   const canvasElement = canvas.value as HTMLCanvasElement | undefined;
@@ -1449,6 +1705,21 @@ onMounted(async () => {
     console.error('Kaleidoscope: interaction layer ref not available');
     return;
   }
+  
+  // Initial layout calculation
+  updateLayout();
+  window.addEventListener('resize', updateLayout);
+
+  // Watch for gallery view state
+  watch(() => Math.round(scrollAnchor.value), (current) => {
+    const isOnGallery = current >= orbs.value.length + 1;
+    emit('gallery-view-change', isOnGallery);
+  });
+  
+  // Watch for active orbs count
+  watch(() => orbs.value.length, (count) => {
+    emit('active-orbs-change', count);
+  }, { immediate: true });
 
 
   interactionElement.addEventListener('mousedown', (mouseEvent) => {
@@ -1507,11 +1778,11 @@ onMounted(async () => {
 
     // 1:1 Direct Vertical Drag
     const totalDragY = mouseEvent.clientY - dragStartY.value;
-    const progressDelta = -totalDragY / ORB_SPACING;
+    const progressDelta = -totalDragY / ORB_SPACING.value;
     scrollAnchor.value = dragStartScrollOffset.value + progressDelta;
     
     // Update velocity for momentum
-    scrollAnchorVel.value = (-dy / ORB_SPACING) / (dt / 1000); // units per sec
+    scrollAnchorVel.value = (-dy / ORB_SPACING.value) / (dt / 1000); // units per sec
     
     // 2. Horizontal Drag (Rotation / Dismiss) - Only if dragging a specific orb
     if (orbDragMouseActive && orbDragMouseStart !== null && activeOrbDragIndex.value !== null) {
@@ -1586,7 +1857,13 @@ onMounted(async () => {
     isUserPressing.value = false;
     mousePrevPosition = null;
     mouseStartPosition = null;
+    
+    // Engage Target Locking
+    resolveScrollTarget();
   });
+
+  // Wheel Timeout for locking
+  let wheelTimeout: any = null;
 
   document.addEventListener('wheel', (wheelEvent) => {
     wheelEvent.preventDefault();
@@ -1597,8 +1874,20 @@ onMounted(async () => {
     const isTrackpad = wheelEvent.deltaMode === 0;
     // Compute impulse from raw delta (single mapping, nonlinear)
     const progressDelta = computeImpulseFromDelta(clampedDelta, isTrackpad);
-    // Apply to physics
-    applyPhysicsScrollImpulse(progressDelta);
+    
+    // Keep target active, update velocity
+    // No cap, just raw accumulation
+    scrollAnchorVel.value += progressDelta * debugFlickMultiplier.value;
+    
+    // Update target immediately
+    resolveScrollTarget();
+    
+    // Schedule lock (as backup)
+    if (wheelTimeout) clearTimeout(wheelTimeout);
+    wheelTimeout = setTimeout(() => {
+        resolveScrollTarget();
+    }, WHEEL_LOCK_TIMEOUT_MS);
+    
   }, { passive: false });
 
   // Use non-passive touch listeners so preventDefault() in handlers stops page scrolling
@@ -1682,6 +1971,7 @@ onMounted(async () => {
   window.addEventListener('scroll', onWindowScroll, { passive: true });
   onUnmounted(() => {
     window.removeEventListener('scroll', onWindowScroll);
+    window.removeEventListener('resize', updateLayout);
   });
 });
 
@@ -1772,24 +2062,47 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
 
     <!-- Grid Gallery -->
     <div
-       v-if="orbs.length > 0"
+       v-if="galleryItems.length > 0"
        class="absolute left-1/2 w-[90vw] max-w-md grid grid-cols-3 gap-3 p-4 transition-all duration-500 ease-out"
        :style="{
           top: '50%',
-          transform: `translate(-50%, -50%) translateY(${(orbs.length - scrollAnchor) * ORB_SPACING}px)`,
-          opacity: Math.max(0, 1 - Math.abs((orbs.length - scrollAnchor) * 0.5))
+          left: '50%',
+          transform: `translate(-50%, -50%) translateY(${(orbs.length + 1 - scrollAnchor) * ORB_SPACING}px)`,
+          opacity: Math.abs(orbs.length + 1 - scrollAnchor) < 0.5 ? 1 : 0,
+          zIndex: 100,
+          pointerEvents: scrollAnchor > orbs.length - 0.5 ? 'auto' : 'none'
        }"
     >
        <div 
-         v-for="(orb, index) in orbs" 
-         :key="orb.id + '-thumb'"
-         class="relative aspect-square rounded-full overflow-hidden cursor-pointer hover:scale-105 active:scale-95 transition-transform bg-neutral-800 border-2 border-neutral-700"
-         @click.stop="scrollToOrb(index)"
+         v-for="item in galleryItems" 
+         :key="item.id"
+         class="relative aspect-square rounded-full overflow-hidden transition-transform bg-neutral-800"
+         :class="[
+            item.status === 'active' ? 'cursor-pointer hover:scale-105 active:scale-95 opacity-70' : ''
+         ]"
+         @click.stop="scrollToGalleryItem(item)"
        >
-          <canvas
-             :ref="(el) => setGridCanvasRef(el, orb.id)"
+          <!-- All items show kaleidoscope thumbnail -->
+          <img
+             :src="item.thumbnailSrc || item.src"
              class="block w-full h-full object-cover"
           />
+          
+          <!-- X Overlay for left swipes -->
+          <div 
+            v-if="item.status === 'left'" 
+            class="absolute inset-0 flex items-center justify-center"
+          >
+             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </div>
+          
+          <!-- Checkmark Overlay for right swipes -->
+          <div 
+            v-if="item.status === 'right'" 
+            class="absolute inset-0 flex items-center justify-center"
+          >
+             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M20 6 9 17l-5-5"/></svg>
+          </div>
        </div>
     </div>
 
@@ -1808,6 +2121,8 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
       crossorigin="anonymous"
     />
   </div>
+
+
 </template>
 
 <style scoped>
