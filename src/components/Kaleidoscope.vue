@@ -16,12 +16,9 @@ const CLICK_MOVE_THRESHOLD_PX = 10;
 
 const facingMode = ref('unknown');
 const cameraZoom = ref(1);
-const scopeRotation = ref(0.0);
 // Independent rotations for each orb (legacy refs kept for compatibility until full physics migration)
 const scopeSize = ref(0.8);
 const scopeOffset = ref([0.0, 0.0]);
-const scopeSizeVel = ref(0.0);
-const scopeRotationVel = ref(0.0);
 const isUserPressing = ref(false);
 const keyPressedShift = ref(false);
 const keyPressedAlt = ref(false);
@@ -120,6 +117,7 @@ const updateLayout = () => {
 const debugMaxImpulse = ref(4.0);
 const debugSpringTension = ref(300.0);
 const debugSpringFriction = ref(48.0);
+const debugFlickMultiplier = ref(1.0);
 const debugSnapbackThreshold = ref(1.0);
 
 // Simplified impulse mapping parameters (single mapping for wheel/trackpad/touch)
@@ -161,9 +159,6 @@ const hasDragMoved = ref(false);
 
 const clampRotationVelocity = (velocity: number): number => {
   return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
-};
-const clampScopeSizeVelocity = (velocity: number): number => {
-  return Math.max(-maxScopeSizeVel, Math.min(maxScopeSizeVel, velocity));
 };
 let texture1: WebGLTexture | null = null;
 let texture2: WebGLTexture | null = null;
@@ -1184,7 +1179,7 @@ async function main(canvasElement: HTMLCanvasElement) {
         const source = getReadySource(orb.img, cameraFallback);
         const displayCanvas = canvasRefs.value[orb.id];
         
-        if (displayCanvas) {
+        if (displayCanvas && gl) {
              gl.uniform1f(scopeRotationBind, orb.rotation);
              gl.uniform1f(rotationVelocityBind, orb.rotationVel);
              
@@ -1193,7 +1188,7 @@ async function main(canvasElement: HTMLCanvasElement) {
              const proximity = Math.max(0, 1 - dist / 400); // 0..1
              const scaleEffect = 1 + proximity * 0.2;
              
-             drawOrbFrame(displayCanvas, source ?? cameraFallback, getOrbScopeScale('center') * scaleEffect, orb.texture); 
+             drawOrbFrame(displayCanvas, source ?? cameraFallback, getOrbScopeScale() * scaleEffect, orb.texture); 
         }
     });
 
@@ -1234,6 +1229,7 @@ interface Point {
   clientX: number;
   clientY: number;
 }
+let mousePrevPosition = null as null|{x: number, y: number};
 let mouseStartPosition = null as null|{x: number, y: number};
 let touchId1: null|number = null;
 let touchOrigin1: null|Point = null;
@@ -1253,9 +1249,6 @@ function getTouchById(touches: TouchList, id: number): Touch | null {
 function touchDistance(t1: Touch, t2: Touch): number {
   return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
 }
-
-// Helper: determine if a point/event is inside the center orb element
-type PointLike = { clientX?: number; clientY?: number; x?: number; y?: number };
 
 const getOrbIndexAtPoint = (p: {x: number, y: number}) => {
    // Only check visible orbs
@@ -1459,9 +1452,6 @@ function touchStartCallback(event: TouchEvent) {
     touchOrigin1 = touch;
     touchPrevTime = new Date().getTime();
     isUserPressing.value = true;
-    scopeRotationVel.value = 0;
-    scopeSizeVel.value = 0;
-    scopeSizeVel.value = 0;
     scrollAnchorVel.value = 0; // Stop existing scroll momentum on touch down
   }
 }
@@ -1701,9 +1691,6 @@ onMounted(async () => {
       mouseStartPosition = pos;
     }
     isUserPressing.value = true;
-    scopeRotationVel.value = 0;
-    scopeSizeVel.value = 0;
-    scopeSizeVel.value = 0;
     scrollAnchorVel.value = 0; // Stop existing scroll momentum
   });
   
