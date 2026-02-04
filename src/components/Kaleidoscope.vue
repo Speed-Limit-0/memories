@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted, computed} from 'vue';
+import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
@@ -18,13 +18,8 @@ const facingMode = ref('unknown');
 const cameraZoom = ref(1);
 const scopeRotation = ref(0.0);
 // Independent rotations for each orb (legacy refs kept for compatibility until full physics migration)
-const scopeRotationTop = ref(0.0);
-const scopeRotationBottom = ref(0.0);
 const scopeSize = ref(0.8);
-const scopeRotationTopVel = ref(0.0);
-const scopeRotationBottomVel = ref(0.0);
 const scopeOffset = ref([0.0, 0.0]);
-const scopeOffsetVel = ref([0.0, 0.0]);
 const scopeSizeVel = ref(0.0);
 const scopeRotationVel = ref(0.0);
 const isUserPressing = ref(false);
@@ -41,12 +36,7 @@ const keyPressedL = ref(false);
 const keyPressedMinus = ref(false);
 const keyPressedPlus = ref(false);
 const canvas = useTemplateRef('canvas');
-const displayCanvasCenter = useTemplateRef('display-canvas-center');
-const displayCanvasTop = useTemplateRef('display-canvas-top');
-const displayCanvasBottom = useTemplateRef('display-canvas-bottom');
-const displayCanvasIncoming = useTemplateRef('display-canvas-incoming');
 const interactionLayer = useTemplateRef('interaction-layer');
-// const centerOrb = useTemplateRef('center-orb'); // Removed
 const uploadedImageElements = ref([] as HTMLImageElement[]);
 const activeImageIndex = ref(0);
 // Removed: topSlotIndex, centerSlotIndex, bottomSlotIndex, orbTransitionProgress, etc. as we move to new system
@@ -59,7 +49,6 @@ interface OrbState {
   y: number; // visual position in pixels relative to center
   vy: number;
   scale: number;
-  rotation: number;
   rotation: number;
   rotationVel: number;
   texture: WebGLTexture | null;
@@ -100,10 +89,6 @@ const ORB_SPACING = ref(0);
 
 // Target Locking Physics
 const scrollTarget = ref<number | null>(null);
-// SCROLL_BREAKTHROUGH_VELOCITY replaced by debugBreakthroughVel
-const SCROLL_PREDICTION_FACTOR = 0.3; // How far ahead to look for target
-// SCROLL_SNAP_TENSION replaced by debugSpringTension
-// SCROLL_SNAP_FRICTION replaced by debugSpringFriction
 const WHEEL_LOCK_TIMEOUT_MS = 150; // Delay after wheel stops to lock target
 
 const updateLayout = () => {
@@ -133,22 +118,14 @@ const updateLayout = () => {
 // Physics & Debug State
 // Physics tuning parameters
 const debugMaxImpulse = ref(4.0);
-const debugBreakthroughVel = ref(10.0);
-const debugExcessCost = ref(4.0);
 const debugSpringTension = ref(300.0);
 const debugSpringFriction = ref(48.0);
-const debugExcessExp = ref(2.0);
-const debugFlickMultiplier = ref(1.0);
 const debugSnapbackThreshold = ref(1.0);
 
 // Simplified impulse mapping parameters (single mapping for wheel/trackpad/touch)
 const ORB_WHEEL_DELTA_MAX = 120; // clamp reference for raw wheel delta
-// ORB_MAX_IMPULSE replaced by debugMaxImpulse
 const ORB_IMPULSE_EXP = 1.8; // nonlinear exponent (>1 makes large deltas grow faster)
 const ORB_TRACKPAD_SCALE = 0.9; // slight device scale for trackpad
-const ORB_FRICTION = 3.0; // lower = less friction (was 8)
-const ORB_VELOCITY_THRESHOLD = 1.2;
-const ORB_MAX_VELOCITY = 20;
 const maxRotationSpeed = 1; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
 let cameraStream: MediaStream | null = null;
@@ -165,8 +142,6 @@ const orbDragTranslateY = ref(0);
 const orbDragScaleMultiplier = ref(1);
 const isOrbDragging = ref(false);
 const isOrbDismissing = ref(false);
-const isCenterHiddenDuringDismiss = ref(false);
-const orbFillAnimating = ref(false);
 let orbDragMouseStart: null | { x: number; y: number } = null;
 let orbDragMouseActive = false;
 let orbDragTouchActive = false;
@@ -179,15 +154,10 @@ const activeOrbDragIndex = ref<number | null>(null);
 const isVerticalDrag = ref(false);
 const dragStartY = ref(0);
 const dragStartScrollOffset = ref(0);
-const dragStartTime = ref(0);
 const dragLastY = ref(0);
 const dragLastTime = ref(0);
 const dragVelocity = ref(0); // in progress units per ms
-const hasDragMoved = ref(false);
-// Conversion: pixels of drag -> 1 unit of scroll progress
-// Height of the screen roughly corresponds to moving 1 full item? 
-// Let's say moving 50% of screen height = 1 full item.
-const PIXELS_PER_SCROLL_UNIT = window.innerHeight * 0.5; 
+const hasDragMoved = ref(false); 
 
 const clampRotationVelocity = (velocity: number): number => {
   return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
@@ -226,9 +196,6 @@ const setCanvasRef = (el: any, id: string) => {
 };
 
 const gridCanvasRefs = ref<Record<string, HTMLCanvasElement>>({});
-const setGridCanvasRef = (el: any, id: string) => {
-  if (el) gridCanvasRefs.value[id] = el as HTMLCanvasElement;
-};
 
 // Maximum texture dimension to reduce upload time and prevent stuttering
 const MAX_TEXTURE_SIZE = 2048;
@@ -264,12 +231,7 @@ const resizeImage = (img: HTMLImageElement): Promise<HTMLImageElement> => {
   });
 };
 
-const getWrappedIndex = (index: number, length: number): number => {
-  if (length <= 0) {
-    return 0;
-  }
-  return ((index % length) + length) % length;
-};
+
 
 
 // ----------------------------------------------------------------------
@@ -287,14 +249,7 @@ const computeImpulseFromDelta = (rawDelta: number, isTrackpad: boolean) => {
   return sign * base * deviceScale;
 };
 
-// Physics-based Wheel Handler Helper
-const applyPhysicsScrollImpulse = (impulse: number) => {
-   // Impulse is in "scroll units". 
-   // We want to add to scrollAnchorVel (units/sec).
-   // If impulse is roughly 0.1 per event...
-   scrollAnchorVel.value += impulse * 5.0; 
-   scrollAnchorVel.value = Math.max(-10, Math.min(10, scrollAnchorVel.value));
-};
+
 
 
 const getOrbStyle = (orb: OrbState) => {
@@ -323,7 +278,7 @@ const getOrbStyle = (orb: OrbState) => {
   };
 };
 
-const getOrbScopeScale = (axis?: any) => {
+const getOrbScopeScale = () => {
    // Legacy shim for drawOrbFrame to compile
    return 1.0; 
 };
@@ -976,6 +931,7 @@ async function main(canvasElement: HTMLCanvasElement) {
   
   const setupTexture = (tex: WebGLTexture | null) => {
     if (!tex) return;
+    if (!gl) return;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -1008,15 +964,7 @@ async function main(canvasElement: HTMLCanvasElement) {
   const rotationVelocityBind = gl.getUniformLocation(program, 'rotationVelocity');
   const transitionProgressBind = gl.getUniformLocation(program, 'transitionProgress');
 
-  function fastNormalSlow(fast: number, normal: number, slow: number) {
-    if (keyPressedShift.value) {
-      return fast;
-    }
-    if (keyPressedAlt.value) {
-      return slow;
-    }
-    return normal;
-  }
+
 
   // Repeatedly pull camera data and render
   const renderToDisplayCanvas = (displayCanvas: HTMLCanvasElement | null, sourceCanvas: HTMLCanvasElement) => {
@@ -1052,21 +1000,22 @@ async function main(canvasElement: HTMLCanvasElement) {
       return;
     }
 
-    gl!.activeTexture(gl!.TEXTURE0);
-    gl!.bindTexture(gl!.TEXTURE_2D, texture1); // Bind unit 0
+    if (!gl) return;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture1); // Bind unit 0
     
     // Use cached texture if available
     if (cachedTexture) {
          // If we have a cached texture, we must bind IT to the active texture unit.
          // Wait, texture1 is the unit 0 texture...
          // Actually, we should bind cachedTexture INSTEAD of texture1 if it exists.
-         gl!.bindTexture(gl!.TEXTURE_2D, cachedTexture);
+         gl.bindTexture(gl.TEXTURE_2D, cachedTexture);
     } else {
-         gl!.bindTexture(gl!.TEXTURE_2D, texture1);
-         gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA, gl!.RGBA, gl!.UNSIGNED_BYTE, imageSource);
+         gl.bindTexture(gl.TEXTURE_2D, texture1);
+         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageSource);
     }
 
-    gl!.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
+    gl.uniform2f(dataDimensionsBind, imageWidth, imageHeight);
     gl.uniform2f(dataDimensions2Bind, imageWidth, imageHeight);
     gl.uniform1f(dataZoomBind, cameraZoom.value);
     gl.uniform1f(scopeSizeBind, scopeSize.value * scopeScaleMultiplier);
@@ -1074,7 +1023,7 @@ async function main(canvasElement: HTMLCanvasElement) {
       gl.uniform1f(transitionProgressBind, 0.0);
     }
     // Draw call
-    gl!.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
     
     // If displayCanvas provided, copy to it. If null, we just drew to the main framebuffer (gl context).
     if (displayCanvas) {
@@ -1084,12 +1033,13 @@ async function main(canvasElement: HTMLCanvasElement) {
 
   // Implement the baker
   bakeKaleidoscopeThumbnail = (img: HTMLImageElement, zoomLevel: 'in' | 'out' = 'out') => {
+      if (!gl) return '';
       // 1. Temporarily bind texture
-      const tex = gl!.createTexture();
+      const tex = gl.createTexture();
       setupTexture(tex);
-      gl!.activeTexture(gl!.TEXTURE0); // Use unit 0
-      gl!.bindTexture(gl!.TEXTURE_2D, tex);
-      gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA, gl!.RGBA, gl!.UNSIGNED_BYTE, img);
+      gl.activeTexture(gl.TEXTURE0); // Use unit 0
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
       
       // 2. Render to main canvas (hidden)
       // Use standard settings for uniformity in gallery
@@ -1097,14 +1047,14 @@ async function main(canvasElement: HTMLCanvasElement) {
       const baseScopeSize = scopeSize.value;
       const zoomedScopeSize = zoomLevel === 'out' ? baseScopeSize * 2.0 : baseScopeSize;
       
-      gl!.uniform2f(dataDimensionsBind, img.width, img.height);
-      gl!.uniform2f(dataDimensions2Bind, img.width, img.height);
-      gl!.uniform1f(dataZoomBind, 1.0); // Reset zoom for thumbnail
-      gl!.uniform1f(scopeSizeBind, zoomedScopeSize);
-      gl!.uniform1f(scopeRotationBind, 0.0); // Standardize rotation
-      gl!.uniform1f(transitionProgressBind, 0.0);
+      gl.uniform2f(dataDimensionsBind, img.width, img.height);
+      gl.uniform2f(dataDimensions2Bind, img.width, img.height);
+      gl.uniform1f(dataZoomBind, 1.0); // Reset zoom for thumbnail
+      gl.uniform1f(scopeSizeBind, zoomedScopeSize);
+      gl.uniform1f(scopeRotationBind, 0.0); // Standardize rotation
+      gl.uniform1f(transitionProgressBind, 0.0);
       
-      gl!.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
       
       // 3. Capture and resize
       // The main canvas might be huge. We want a small thumb.
@@ -1115,14 +1065,14 @@ async function main(canvasElement: HTMLCanvasElement) {
       const tCtx = tempCanvas.getContext('2d');
       if (tCtx) {
           tCtx.drawImage(canvasElement, 0, 0, canvasElement.width, canvasElement.height, 0, 0, thumbSize, thumbSize);
-          // Cleanup
-          gl!.deleteTexture(tex);
-          // Resizing to small prevents massive base64 strings
-          return tempCanvas.toDataURL('image/jpeg', 0.8);
-      }
-      
-      gl!.deleteTexture(tex);
-      return canvasElement.toDataURL('image/jpeg', 0.8);
+           // Cleanup
+           gl.deleteTexture(tex);
+           // Resizing to small prevents massive base64 strings
+           return tempCanvas.toDataURL('image/jpeg', 0.8);
+       }
+       
+       gl.deleteTexture(tex);
+       return canvasElement.toDataURL('image/jpeg', 0.8);
   };
   
   // Bake any pending items (from initial load)
@@ -1147,11 +1097,6 @@ async function main(canvasElement: HTMLCanvasElement) {
     lastAnimateTime = now;
 
     // 1. Scroll Anchor Physics
-    
-    // Bounds (Rubber Band targets)
-    // Add +1 slot for the grid gallery at the end
-    const maxScroll = Math.max(0, orbs.value.length + 1);
-    let target = null; // If non-null, we spring towards this
 
     if (!isUserPressing.value) {
        // Bounds logic handled by target clamping in resolveScrollTarget
@@ -1229,6 +1174,7 @@ async function main(canvasElement: HTMLCanvasElement) {
     const cameraFallback = camera;
 
     // Shared uniforms
+    if (!gl) return;
     gl.uniform1i(dataIsFacingUserBind, facingMode.value === 'user' ? 1 : 0);
     gl.uniform1i(scopeShapeBind, props.scopeShape);
     gl.uniform2f(scopeOffsetBind, scopeOffset.value[0], scopeOffset.value[1]);
@@ -1254,20 +1200,20 @@ async function main(canvasElement: HTMLCanvasElement) {
     // 4. Grid Gallery Rendering (If visible)
     // Check if we are physically near the bottom
     // We render grid if scrollAnchor is nearing the end
-    const distFromBottom = Math.max(0, (orbs.value.length - scrollAnchor));
-    // distFromBottom: 0 = fully at bottom (grid centered). 1 = 1 orb away.
     // Show grid if within ~2 screens of bottom?
     // Grid opacity logic in template: 1 - Math.abs((length - scroll) * 0.5)
     // So visible when abs diff < 2.
-    if (Math.abs(orbs.value.length - scrollAnchor) < 3.0) {
+    if (Math.abs(orbs.value.length - scrollAnchor.value) < 3.0) {
         orbs.value.forEach(orb => {
             const gridCanvas = gridCanvasRefs.value[orb.id];
             if (gridCanvas) {
                 const source = getReadySource(orb.img, cameraFallback);
-                gl!.uniform1f(scopeRotationBind, orb.rotation);
-                gl!.uniform1f(rotationVelocityBind, orb.rotationVel);
-                // No extra scale effect for grid items
-                drawOrbFrame(gridCanvas, source ?? cameraFallback, 1.0, orb.texture);
+                if (gl) {
+                  gl.uniform1f(scopeRotationBind, orb.rotation);
+                  gl.uniform1f(rotationVelocityBind, orb.rotationVel);
+                  // No extra scale effect for grid items
+                  drawOrbFrame(gridCanvas, source ?? cameraFallback, 1.0, orb.texture);
+                }
             }
         });
     }
@@ -1288,7 +1234,6 @@ interface Point {
   clientX: number;
   clientY: number;
 }
-let mousePrevPosition = null as null|{x: number, y: number};
 let mouseStartPosition = null as null|{x: number, y: number};
 let touchId1: null|number = null;
 let touchOrigin1: null|Point = null;
@@ -1336,11 +1281,7 @@ const getOrbIndexAtPoint = (p: {x: number, y: number}) => {
    return -1;
 };
 
-// Legacy hit test replaced by getOrbIndexAtPoint(pos) !== -1
-const isPointInsideCenterOrb = (p: PointLike | Touch | MouseEvent): boolean => {
-    // Unused now
-    return false;
-};
+
 
 // Reset drag visuals for center orb
 const resetOrbDragVisuals = () => {
