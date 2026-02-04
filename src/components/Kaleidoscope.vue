@@ -19,6 +19,7 @@ const cameraZoom = ref(1);
 // Independent rotations for each orb (legacy refs kept for compatibility until full physics migration)
 const scopeSize = ref(0.8);
 const scopeOffset = ref([0.0, 0.0]);
+const scopeSizeVel = ref(0.0);
 const isUserPressing = ref(false);
 const keyPressedShift = ref(false);
 const keyPressedAlt = ref(false);
@@ -159,6 +160,9 @@ const hasDragMoved = ref(false);
 
 const clampRotationVelocity = (velocity: number): number => {
   return Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, velocity));
+};
+const clampScopeSizeVelocity = (velocity: number): number => {
+  return Math.max(-maxScopeSizeVel, Math.min(maxScopeSizeVel, velocity));
 };
 let texture1: WebGLTexture | null = null;
 let texture2: WebGLTexture | null = null;
@@ -1229,7 +1233,6 @@ interface Point {
   clientX: number;
   clientY: number;
 }
-let mousePrevPosition = null as null|{x: number, y: number};
 let mouseStartPosition = null as null|{x: number, y: number};
 let touchId1: null|number = null;
 let touchOrigin1: null|Point = null;
@@ -1680,14 +1683,12 @@ onMounted(async () => {
       orbDragMouseStart = pos;
       orbDragLastX = pos.x;
       isOrbDragging.value = true;
-      mousePrevPosition = null;
       mouseStartPosition = null;
     } else {
       activeOrbDragIndex.value = null;
       orbDragMouseActive = false;
       orbDragMouseStart = null;
       isOrbDragging.value = false;
-      mousePrevPosition = pos;
       mouseStartPosition = pos;
     }
     isUserPressing.value = true;
@@ -1733,11 +1734,6 @@ onMounted(async () => {
     
     hasDragMoved.value = true;
     
-    // Background interaction? (mousePrevPosition is not null)
-    mousePrevPosition = {
-      x: mouseEvent.clientX,
-      y: mouseEvent.clientY,
-    };
     mousePrevTime = now;
     // Keep drag tracker updated for consistency
     dragLastY.value = mouseEvent.clientY;
@@ -1783,7 +1779,6 @@ onMounted(async () => {
     // Cleanup shared state
     isVerticalDrag.value = false;
     isUserPressing.value = false;
-    mousePrevPosition = null;
     mouseStartPosition = null;
     
     // Engage Target Locking
