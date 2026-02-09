@@ -13,6 +13,16 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
     <title>Kaleidoscope</title>
+    <script>
+      // Block camera access for this app (runs before any other script, including cached bundles)
+      (function() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+        var realGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+        navigator.mediaDevices.getUserMedia = function() {
+          return Promise.reject(new DOMException('Camera is disabled for this app', 'NotAllowedError'));
+        };
+      })();
+    </script>
   </head>
   <body>
     <div id="app" class="relative"></div>

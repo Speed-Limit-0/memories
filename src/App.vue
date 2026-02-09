@@ -121,15 +121,20 @@ window.addEventListener('keypress', (keyEvent) => {
   </button>
   <div
     v-if="!showCapture && activeOrbsCount === 0 && !hasGalleryItems"
-    class="fixed left-1/2 pointer-events-none z-10 min-w-[200px] min-h-[200px] w-[60vmin] h-[60vmin] -translate-x-1/2 -translate-y-1/2 flex items-center justify-center rounded-full border-2 border-black"
+    class="fixed left-1/2 pointer-events-none z-10 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center gap-6"
     style="top: 50%"
     aria-hidden="true"
   >
-    <img
-      src="/upload.svg"
-      alt=""
-      class="w-12 h-12 sm:w-14 sm:h-14 select-none brightness-0"
-    >
+    <h1 class="text-3xl font-bold text-center text-black dark:text-white">
+      All Done!
+    </h1>
+    <div class="min-w-[200px] min-h-[200px] w-[60vmin] h-[60vmin] flex items-center justify-center rounded-full border-2 border-black">
+      <img
+        src="/upload.svg"
+        alt=""
+        class="w-12 h-12 sm:w-14 sm:h-14 select-none brightness-0"
+      >
+    </div>
   </div>
   <input
     ref="file-input"

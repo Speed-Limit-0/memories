@@ -75,6 +75,7 @@ const galleryItems = ref<GalleryItem[]>([]);
 // We treat "1 unit" of scroll as "one orb height + gap"
 const scrollAnchor = ref(0);
 const scrollAnchorVel = ref(0);
+const pendingScrollToGallery = ref(false);
 
 // Physics Constants
 // Physics Constants
@@ -127,7 +128,6 @@ const ORB_IMPULSE_EXP = 1.8; // nonlinear exponent (>1 makes large deltas grow f
 const ORB_TRACKPAD_SCALE = 0.9; // slight device scale for trackpad
 const maxRotationSpeed = 1; // Maximum rotation velocity
 const maxScopeSizeVel = 0.12; // Maximum zoom velocity for physics follow-through
-let cameraStream: MediaStream | null = null;
 // Scroll -> rotation mapping: scale factor applied to scroll velocity (px/ms) to rotation velocity
 const SCROLL_ROTATION_SCALE = 0.003;
 // Track last window scroll position/time to compute scroll velocity
@@ -285,20 +285,11 @@ const getOrbScopeScale = () => {
 
 
 const getReadySource = (
-  primary: HTMLImageElement | HTMLVideoElement | null,
-  fallback: HTMLImageElement | HTMLVideoElement | null
-) => {
-  if (primary instanceof HTMLImageElement) {
-    if (primary.complete && primary.naturalWidth > 0) {
-      return primary;
-    }
-    return fallback;
-  }
-  if (primary instanceof HTMLVideoElement) {
-    if (primary.readyState >= 2 && primary.videoWidth > 0) {
-      return primary;
-    }
-    return fallback;
+  primary: HTMLImageElement | null,
+  fallback: HTMLCanvasElement
+): HTMLImageElement | HTMLCanvasElement => {
+  if (primary && primary.complete && primary.naturalWidth > 0) {
+    return primary;
   }
   return fallback;
 };
@@ -375,11 +366,6 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
     scrollAnchorVel.value = 0;
     
     facingMode.value = 'environment';
-    
-    if (cameraStream) {
-      cameraStream.getTracks().forEach(track => track.stop());
-      cameraStream = null;
-    }
   } else {
     uploadedImageElements.value = [];
     orbs.value = [];
@@ -432,38 +418,19 @@ const resolveScrollTarget = () => {
 };
 
 async function main(canvasElement: HTMLCanvasElement) {
-  // Capture webcam input using invisible `video` element
-  // Adapted from p5js.org/examples/3d-shader-using-webcam.html
-  const camera = document.getElementById('camera') as HTMLVideoElement;
+  // No webcam: use a small placeholder canvas as fallback when orb image isn't ready
+  const fallbackCanvas = document.createElement('canvas');
+  fallbackCanvas.width = 2;
+  fallbackCanvas.height = 2;
+  const ctx = fallbackCanvas.getContext('2d');
+  if (ctx) {
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(0, 0, 2, 2);
+  }
 
   // If images are uploaded, create image elements for them
   if (props.uploadedImages && props.uploadedImages.length > 0) {
     await loadUploadedImages(props.uploadedImages);
-  } else {
-    // Ask user permission to record their camera
-    try {
-      cameraStream = await navigator.mediaDevices.getUserMedia({video: { facingMode: { exact: 'environment'} }, audio: false});
-      facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-    } catch (e) {
-      console.info('Failed to get environment camera. Trying any camera, under the assumption it is a user-facing camera', e);
-      try {
-        cameraStream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
-        facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-      } catch (e2) {
-        if ((e2 as Error).name === 'ConstraintNotSatisfiedError') {
-          console.error('Device has no camera', e2);
-        } else if ((e2 as Error).name === 'PermissionDeniedError') {
-          console.error('Permissions not accepted', e2);
-        } else {
-          console.error('Other error', e2);
-        }
-      }
-    }
-
-    if (cameraStream !== null) {
-      camera.srcObject = cameraStream;
-      camera.play();
-    }
   }
 
   // Canvas with WebGL context (element passed from template ref so it exists when mounted)
@@ -988,13 +955,12 @@ async function main(canvasElement: HTMLCanvasElement) {
 
   const drawOrbFrame = (
     displayCanvas: HTMLCanvasElement | null,
-    imageSource: HTMLImageElement | HTMLVideoElement,
+    imageSource: HTMLImageElement | HTMLCanvasElement,
     scopeScaleMultiplier: number,
     cachedTexture: WebGLTexture | null = null
   ) => {
-    const isVideo = imageSource instanceof HTMLVideoElement;
-    const imageWidth = isVideo ? imageSource.videoWidth : imageSource.width;
-    const imageHeight = isVideo ? imageSource.videoHeight : imageSource.height;
+    const imageWidth = imageSource.width;
+    const imageHeight = imageSource.height;
     if (imageWidth <= 0 || imageHeight <= 0) {
       return;
     }
@@ -1170,7 +1136,7 @@ async function main(canvasElement: HTMLCanvasElement) {
     }
     
     // 3. Render Cycle
-    const cameraFallback = camera;
+    const imageFallback = fallbackCanvas;
 
     // Shared uniforms
     if (!gl) return;
@@ -1180,7 +1146,7 @@ async function main(canvasElement: HTMLCanvasElement) {
     gl.uniform2f(canvasDimensionsBind, canvasSize, canvasSize);
 
     visibleOrbs.forEach(orb => {
-        const source = getReadySource(orb.img, cameraFallback);
+        const source = getReadySource(orb.img, imageFallback);
         const displayCanvas = canvasRefs.value[orb.id];
         
         if (displayCanvas && gl) {
@@ -1192,7 +1158,7 @@ async function main(canvasElement: HTMLCanvasElement) {
              const proximity = Math.max(0, 1 - dist / 400); // 0..1
              const scaleEffect = 1 + proximity * 0.2;
              
-             drawOrbFrame(displayCanvas, source ?? cameraFallback, getOrbScopeScale() * scaleEffect, orb.texture); 
+             drawOrbFrame(displayCanvas, source ?? imageFallback, getOrbScopeScale() * scaleEffect, orb.texture); 
         }
     });
 
@@ -1206,12 +1172,12 @@ async function main(canvasElement: HTMLCanvasElement) {
         orbs.value.forEach(orb => {
             const gridCanvas = gridCanvasRefs.value[orb.id];
             if (gridCanvas) {
-                const source = getReadySource(orb.img, cameraFallback);
+                const source = getReadySource(orb.img, imageFallback);
                 if (gl) {
                   gl.uniform1f(scopeRotationBind, orb.rotation);
                   gl.uniform1f(rotationVelocityBind, orb.rotationVel);
                   // No extra scale effect for grid items
-                  drawOrbFrame(gridCanvas, source ?? cameraFallback, 1.0, orb.texture);
+                  drawOrbFrame(gridCanvas, source ?? imageFallback, 1.0, orb.texture);
                 }
             }
         });
@@ -1400,6 +1366,8 @@ const removeUploadedImageAtIndex = (index: number) => {
   if (activeImageIndex.value >= uploadedImageElements.value.length) {
     activeImageIndex.value = Math.max(0, uploadedImageElements.value.length - 1);
   }
+
+  // Scroll to gallery is handled by the watcher on orbs.value.length
   // No syncSlotIndices needed, physics handles it
 };
 
@@ -1571,7 +1539,9 @@ function touchEndCallback(event: TouchEvent) {
         const deltaX = touch.clientX - touchOrigin1.clientX;
         const deltaY = touch.clientY - touchOrigin1.clientY;
         const dist = Math.hypot(deltaX, deltaY);
-        if (dist < CLICK_MOVE_THRESHOLD_PX) {
+        // Truly empty: no gallery items AND no items with status left/right
+        const isTrulyEmpty = galleryItems.value.length === 0 && !galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
+        if (dist < CLICK_MOVE_THRESHOLD_PX && orbs.value.length === 0 && isTrulyEmpty) {
           emit('upload-click');
         }
       }
@@ -1601,6 +1571,13 @@ function touchEndCallback(event: TouchEvent) {
   
   // Engage Target Locking
   resolveScrollTarget();
+  
+  // After resolveScrollTarget: if all orbs dismissed, scroll to gallery (overrides snap-to-0)
+  if (orbs.value.length === 0 && galleryItems.value.some(item => item.status === 'left' || item.status === 'right')) {
+    scrollAnchorVel.value = 0;
+    scrollTarget.value = 1;
+    pendingScrollToGallery.value = false;
+  }
 }
 
 function touchCancelCallback() {
@@ -1653,6 +1630,17 @@ onMounted(async () => {
   // Watch for active orbs count
   watch(() => orbs.value.length, (count) => {
     emit('active-orbs-change', count);
+    
+    // When all orbs are dismissed, smoothly scroll to gallery (results)
+    if (count === 0) {
+      const hasDismissedOrbs = galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
+      if (hasDismissedOrbs) {
+        pendingScrollToGallery.value = false;
+        // Smooth spring animation to gallery position
+        scrollAnchorVel.value = 0;
+        scrollTarget.value = 1; // gallery sits at orbs.length + 1 = 0 + 1 = 1
+      }
+    }
   }, { immediate: true });
 
 
@@ -1771,7 +1759,9 @@ onMounted(async () => {
       const deltaY = mouseEvent.clientY - mouseStartPosition.y;
       const dist = Math.hypot(deltaX, deltaY);
       
-      if (dist < CLICK_MOVE_THRESHOLD_PX) {
+      // Truly empty: no gallery items AND no items with status left/right
+      const isTrulyEmpty = galleryItems.value.length === 0 && !galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
+      if (dist < CLICK_MOVE_THRESHOLD_PX && orbs.value.length === 0 && isTrulyEmpty) {
         emit('upload-click');
       }
     }
@@ -1783,6 +1773,13 @@ onMounted(async () => {
     
     // Engage Target Locking
     resolveScrollTarget();
+    
+    // After resolveScrollTarget: if all orbs dismissed, scroll to gallery (overrides snap-to-0)
+    if (orbs.value.length === 0 && galleryItems.value.some(item => item.status === 'left' || item.status === 'right')) {
+      scrollAnchorVel.value = 0;
+      scrollTarget.value = 1;
+      pendingScrollToGallery.value = false;
+    }
   });
 
   // Wheel Timeout for locking
@@ -1918,10 +1915,9 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
     // If we already removed locally as part of a dismiss gesture, just clear the pending marker.
     if (pendingOrbRemovalIndex.value !== null && removedIndex === pendingOrbRemovalIndex.value) {
       pendingOrbRemovalIndex.value = null;
-      if (newImages.length > 0) {
-        // Physics handles gap fill automatically
-        return;
-      }
+      // removeUploadedImageAtIndex already handled orb removal and set scrollTarget
+      // for smooth gallery transition — let the spring physics do its work.
+      return;
     }
 
     // Otherwise apply the same removal locally without reloading images.
@@ -1937,25 +1933,20 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
     uploadedImageElements.value = [];
     orbs.value = [];
     activeImageIndex.value = 0;
-    scrollAnchor.value = 0;
-    // Restart camera if no images are uploaded
-    const camera = document.getElementById('camera') as HTMLVideoElement | null;
-    if (camera && !cameraStream) {
-      try {
-        cameraStream = await navigator.mediaDevices.getUserMedia({video: { facingMode: { exact: 'environment'} }, audio: false});
-        facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-      } catch {
-        try {
-          cameraStream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
-          facingMode.value = cameraStream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user';
-        } catch (e2) {
-          console.error('Failed to restart camera', e2);
-        }
-      }
-      if (cameraStream && camera) {
-        camera.srcObject = cameraStream;
-        camera.play();
-      }
+    // Dismissed orbs: any items with status 'left' or 'right'
+    const hasDismissedOrbs = galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
+    // Truly empty: no gallery items AND no items with status left/right
+    const isTrulyEmpty = galleryItems.value.length === 0 && !hasDismissedOrbs;
+
+    // When there are dismissed orbs (gallery), smooth-scroll to gallery screen; otherwise reset
+    if (hasDismissedOrbs) {
+      // Use scrollTarget so the spring physics animate smoothly to the gallery position
+      scrollAnchorVel.value = 0;
+      scrollTarget.value = 1; // gallery sits at orbs.length + 1 = 0 + 1 = 1
+      // Do NOT restart camera when viewing gallery
+    } else {
+      scrollAnchor.value = 0;
+      // Webcam is not used; no camera restart.
     }
   }
 }, { immediate: false });
@@ -2034,14 +2025,6 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
       id="maincanvas"
       ref="canvas"
       class="absolute -left-[9999px] -top-[9999px] opacity-0 pointer-events-none"
-    />
-    <video
-      id="camera"
-      visible="False"
-      style="width: 512px; height: 512px; display:none;"
-      controls="true"
-      playsinline
-      crossorigin="anonymous"
     />
   </div>
 
