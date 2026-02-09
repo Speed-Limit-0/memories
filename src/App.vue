@@ -14,7 +14,7 @@ const fileInputRef = useTemplateRef('file-input');
 
 type RemovedImage = { image: string; index: number };
 const undoStack = ref<RemovedImage[]>([]);
-const canUndo = computed(() => undoStack.value.length > 0);
+const canUndo = computed(() => undoStack.value.length > 0 && uploadedImages.value.length > 0);
 
 const isOnGallery = ref(false);
 const activeOrbsCount = ref(0);

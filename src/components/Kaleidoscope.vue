@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted} from 'vue';
+import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted, computed} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
@@ -60,6 +60,7 @@ interface GalleryItem {
   thumbnailSrc?: string; // Baked kaleidoscope preview
   originalSrc: string; // Keep original reference
   status: 'active' | 'left' | 'right';
+  isFake: boolean;
 }
 
 // Global helper to bake thumbnails (assigned in main)
@@ -71,6 +72,14 @@ let gl: WebGLRenderingContext | null = null;
 
 const orbs = ref<OrbState[]>([]);
 const galleryItems = ref<GalleryItem[]>([]);
+const dismissedGalleryItems = computed(() => 
+  galleryItems.value.filter(item => item.status === 'left' || item.status === 'right')
+);
+const hasDismissedOrbs = computed(() => dismissedGalleryItems.value.length > 0);
+const realGalleryItems = computed(() => dismissedGalleryItems.value.filter(item => !item.isFake));
+const fakeGalleryItems = computed(() => dismissedGalleryItems.value.filter(item => item.isFake));
+const showDebugMenu = ref(false);
+
 // Global scroll anchor (target position for index 0)
 // We treat "1 unit" of scroll as "one orb height + gap"
 const scrollAnchor = ref(0);
@@ -314,10 +323,11 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
       // Target position will be calculated in the physics loop
       // Reconcile with gallery items
       let galleryId = '';
-      const existingItem = galleryItems.value.find(item => item.src === src && item.status === 'active' && !loadedOrbs.some(o => o.galleryId === item.id));
+      const existingItem = galleryItems.value.find(item => item.src === src && !loadedOrbs.some(o => o.galleryId === item.id));
       
       if (existingItem) {
         galleryId = existingItem.id;
+        existingItem.status = 'active'; // Reset status when it becomes an active orb again (e.g. on undo)
       } else {
         galleryId = `gallery-${Date.now()}-${index}`;
         
@@ -337,7 +347,8 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
           img: resizedImg, 
           thumbnailSrc: thumb,
           originalSrc: src,
-          status: 'active'
+          status: 'active',
+          isFake: false,
         });
       }
 
@@ -380,12 +391,17 @@ const resolveScrollTarget = () => {
     const mag = Math.abs(velocity);
     const sign = Math.sign(velocity) || 1;
     
+    // Lock logic: if all orbs are dismissed, position is fixed at the gallery (1)
+    const minBound = (orbs.value.length === 0 && hasDismissedOrbs.value) ? 1 : 0;
+    // Allow scrolling one extra step for the Split View (Fake/Real) if we have dismissed orbs
+    const maxBound = orbs.value.length + (hasDismissedOrbs.value ? 2 : 1);
+    
     // Always calculate a target if we have velocity
     if (mag > 0.01) {
         // SNAPBACK ZONE: If velocity is too low, don't leave the current orb.
         // This creates the "magnetic" pull feeling.
         if (mag < debugSnapbackThreshold.value) {
-             scrollTarget.value = Math.max(0, Math.min(orbs.value.length + 1, Math.round(current)));
+             scrollTarget.value = Math.max(minBound, Math.min(maxBound, Math.round(current)));
              return; 
         }
 
@@ -404,8 +420,11 @@ const resolveScrollTarget = () => {
             // Scrolling down from last orb -> skip to gallery
             target = sign > 0 ? orbs.value.length + 1 : orbs.value.length - 1;
         }
+
+        // Prevent getting stuck between Result and Split View if flicked hard?
+        // No, physics handles it nicely via snapped target.
         
-        scrollTarget.value = Math.max(0, Math.min(orbs.value.length + 1, target));
+        scrollTarget.value = Math.max(minBound, Math.min(maxBound, target));
 
         // Velocity dampening: limit velocity so the spring settles quickly without large overshoot
         if (Math.abs(scrollAnchorVel.value) > 6.0) {
@@ -413,7 +432,7 @@ const resolveScrollTarget = () => {
         }
     } else {
         // If almost stopped, snap to absolute nearest
-        scrollTarget.value = Math.max(0, Math.min(orbs.value.length + 1, Math.round(current)));
+        scrollTarget.value = Math.max(minBound, Math.min(maxBound, Math.round(current)));
     }
 };
 
@@ -1453,7 +1472,10 @@ function touchMoveCallback(event: TouchEvent) {
     // 1. Vertical Drag (Scroll)
     const totalDragY = touch.clientY - dragStartY.value;
     const progressDelta = -totalDragY / ORB_SPACING.value; // Up drag (negative Y) -> Positive scroll
-    scrollAnchor.value = dragStartScrollOffset.value + progressDelta;
+    
+    const minBound = (orbs.value.length === 0 && hasDismissedOrbs.value) ? 1 : 0;
+    const maxBound = orbs.value.length + (hasDismissedOrbs.value ? 2 : 1);
+    scrollAnchor.value = Math.max(minBound, Math.min(maxBound, dragStartScrollOffset.value + progressDelta));
     
     // Update velocity for momentum (using immediate dy for responsiveness)
     scrollAnchorVel.value = (-dy / ORB_SPACING.value) / (dt / 1000); 
@@ -1539,8 +1561,8 @@ function touchEndCallback(event: TouchEvent) {
         const deltaX = touch.clientX - touchOrigin1.clientX;
         const deltaY = touch.clientY - touchOrigin1.clientY;
         const dist = Math.hypot(deltaX, deltaY);
-        // Truly empty: no gallery items AND no items with status left/right
-        const isTrulyEmpty = galleryItems.value.length === 0 && !galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
+        // Truly empty: no orbs AND no dismissed orbs in gallery
+        const isTrulyEmpty = orbs.value.length === 0 && !hasDismissedOrbs.value;
         if (dist < CLICK_MOVE_THRESHOLD_PX && orbs.value.length === 0 && isTrulyEmpty) {
           emit('upload-click');
         }
@@ -1573,7 +1595,7 @@ function touchEndCallback(event: TouchEvent) {
   resolveScrollTarget();
   
   // After resolveScrollTarget: if all orbs dismissed, scroll to gallery (overrides snap-to-0)
-  if (orbs.value.length === 0 && galleryItems.value.some(item => item.status === 'left' || item.status === 'right')) {
+  if (orbs.value.length === 0 && hasDismissedOrbs.value) {
     scrollAnchorVel.value = 0;
     scrollTarget.value = 1;
     pendingScrollToGallery.value = false;
@@ -1603,6 +1625,118 @@ const scrollToGalleryItem = (item: GalleryItem) => {
   }
 };
 
+
+
+const getGalleryItemStyle = (item: GalleryItem, index: number) => {
+    // Transition t: 0 = Grid (scrollAnchor ~ length+1), 1 = Split (scrollAnchor ~ length+2)
+    // We want the transition to happen between length+1 and length+2
+    const t = Math.max(0, Math.min(1, scrollAnchor.value - (orbs.value.length + 1)));
+    
+    // Grid Position (Default 3-column)
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    
+    // Grid: 3 columns, approx 30vw width items, centered
+    const gridCols = 3;
+    const gridItemSize = Math.min(vw * 0.28, 150); // px
+    const gridGap = 12; // px
+    const gridRow = Math.floor(index / gridCols);
+    const gridCol = index % gridCols;
+    
+    // Total grid size
+    const gridTotalWidth = gridCols * gridItemSize + (gridCols - 1) * gridGap;
+    // const gridTotalHeight = Math.ceil(dismissedGalleryItems.value.length / gridCols) * (gridItemSize + gridGap);
+    
+    // Center of screen
+    const cx = vw / 2;
+    const cy = vh / 2;
+    
+    const gridX = cx + (gridCol - 1) * (gridItemSize + gridGap); // -1 to center 0,1,2 around 1
+    // Center rows? Or top-align in gallery container?
+    // User scroll moves the container.
+    // The container is centered at 50% top.
+    // Let's align grid rows relative to that center.
+    // Row 0 starts at top-ish.
+    // Let's say row 0 is at -1.5 rows up? No, let's just stack from top of the container box.
+    // The container in template is roughly centered.
+    // Let's center the WHOLE grid block vertically relative to container center
+    const totalRows = Math.ceil(dismissedGalleryItems.value.length / gridCols);
+    const gridBlockHeight = totalRows * gridItemSize + (totalRows - 1) * gridGap;
+    const gridY = cy - gridBlockHeight / 2 + gridRow * (gridItemSize + gridGap) + gridItemSize/2;
+
+
+    // Split View Position (2 columns: Real Left, Fake Right)
+    // Real Column Center: 25% w
+    // Fake Column Center: 75% w
+    const side = item.isFake ? 1 : -1; // 1 = Right, -1 = Left
+    const splitCenterX = side === -1 ? vw * 0.25 : vw * 0.75;
+    
+    // Stack index within the sub-list
+    const localIndex = item.isFake 
+        ? fakeGalleryItems.value.findIndex(i => i.id === item.id)
+        : realGalleryItems.value.findIndex(i => i.id === item.id);
+        
+    const splitItemSize = Math.min(vw * 0.4, 200); // Larger in split view?
+    const splitGap = 16;
+    
+    // Center the stack vertically? Or just list from top?
+    // Let's list from top of the screen (with padding for header)
+    const headerHeight = 80;
+    // If list is long, we might need scrolling logic. 
+    // For now, center the "block" of items if it fits, else start from top.
+    const collection = item.isFake ? fakeGalleryItems.value : realGalleryItems.value;
+    const totalSplitRows = collection.length;
+    const splitBlockHeight = totalSplitRows * splitItemSize + (totalSplitRows - 1) * splitGap;
+    
+    // If it fits, center it. If not, start from top+header.
+    // To keep it simple: center relative to screen center, same as grid.
+    // const splitY = cy - splitBlockHeight / 2 + localIndex * (splitItemSize + splitGap) + splitItemSize/2;
+    
+    // Position below the "Real"/"Fake" text headers (approx 120px-150px down)
+    const splitStartY = 160; 
+    const splitY = splitStartY + localIndex * (splitItemSize + splitGap) + splitItemSize/2;
+    
+    // Lerp
+    const x = gridX + (splitCenterX - gridX) * t;
+    const y = gridY + (splitY - gridY) * t;
+    const size = gridItemSize + (splitItemSize - gridItemSize) * t;
+    const opacity = 1.0; // Always visible
+    
+    // Handle container scroll offset:
+    // The container ITSELF moves up as we scroll past length+1?
+    // In the previous code, the container translateY was: (orbs.length + 1 - scrollAnchor) * ORB_SPACING
+    // This moves the whole grid UP/DOWN with scroll.
+    // If we want the items to morph in place while the "page" scrolls, we need to respect that.
+    // BUT: The "Transition" is driven by scrollAnchor too.
+    // If scrollAnchor moves from L+1 to L+2, the container moves up by ORB_SPACING.
+    // We want the items to STAY roughly centered or move naturally.
+    // If we use fixed positioning for items relative to screen, we don't need the container transform!
+    // Let's use position fixed/absolute relative to screen text, and computed coordinates.
+    
+    // Correction:
+    // When scrollAnchor = L+1, we want items at GridY.
+    // When scrollAnchor = L+2, we want items at SplitY.
+    // But we ALSO assume the user is "scrolling down".
+    // Does the "Grid" scroll off screen up?
+    // "No, the orbs themselves should shift into 2 columns".
+    // This implies they morph IN PLACE or while scrolling.
+    
+    // Let's add a global Y offset based on (scrollAnchor - (L+1)) IF we want to scroll the split list?
+    // Actually, let's keep them centered on screen for the "View", and if list is too long, scroll?
+    // For this task, let's assume they fit or center.
+    
+    return {
+        position: 'absolute',
+        left: '0px',
+        top: '0px',
+        width: `${size}px`,
+        height: `${size}px`,
+        transform: `translate(${x - size/2}px, ${y - size/2}px)`,
+        // Fade out slightly effectively if we scroll WAY past?
+        // No, keep them visible.
+    };
+};
+
 onMounted(async () => {
   await nextTick();
   const canvasElement = canvas.value as HTMLCanvasElement | undefined;
@@ -1611,6 +1745,22 @@ onMounted(async () => {
     return;
   }
   main(canvasElement);
+  
+  // Force update when window resizes
+  window.addEventListener('resize', () => { 
+      updateLayout();
+      // force re-render of styles
+      scrollAnchor.value = scrollAnchor.value; 
+  });
+
+  
+  // Force update when window resizes
+  window.addEventListener('resize', () => { 
+      updateLayout();
+      // force re-render of styles
+      scrollAnchor.value = scrollAnchor.value; 
+  });
+
   const interactionElement = interactionLayer.value as HTMLDivElement | undefined;
   if (!interactionElement) {
     console.error('Kaleidoscope: interaction layer ref not available');
@@ -1632,14 +1782,11 @@ onMounted(async () => {
     emit('active-orbs-change', count);
     
     // When all orbs are dismissed, smoothly scroll to gallery (results)
-    if (count === 0) {
-      const hasDismissedOrbs = galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
-      if (hasDismissedOrbs) {
+    if (count === 0 && hasDismissedOrbs.value) {
         pendingScrollToGallery.value = false;
         // Smooth spring animation to gallery position
         scrollAnchorVel.value = 0;
         scrollTarget.value = 1; // gallery sits at orbs.length + 1 = 0 + 1 = 1
-      }
     }
   }, { immediate: true });
 
@@ -1696,7 +1843,10 @@ onMounted(async () => {
     // 1:1 Direct Vertical Drag
     const totalDragY = mouseEvent.clientY - dragStartY.value;
     const progressDelta = -totalDragY / ORB_SPACING.value;
-    scrollAnchor.value = dragStartScrollOffset.value + progressDelta;
+    
+    const minBound = (orbs.value.length === 0 && hasDismissedOrbs.value) ? 1 : 0;
+    const maxBound = orbs.value.length + (hasDismissedOrbs.value ? 2 : 1);
+    scrollAnchor.value = Math.max(minBound, Math.min(maxBound, dragStartScrollOffset.value + progressDelta));
     
     // Update velocity for momentum
     scrollAnchorVel.value = (-dy / ORB_SPACING.value) / (dt / 1000); // units per sec
@@ -1759,8 +1909,8 @@ onMounted(async () => {
       const deltaY = mouseEvent.clientY - mouseStartPosition.y;
       const dist = Math.hypot(deltaX, deltaY);
       
-      // Truly empty: no gallery items AND no items with status left/right
-      const isTrulyEmpty = galleryItems.value.length === 0 && !galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
+      // Truly empty: no orbs AND no dismissed orbs in gallery
+      const isTrulyEmpty = orbs.value.length === 0 && !hasDismissedOrbs.value;
       if (dist < CLICK_MOVE_THRESHOLD_PX && orbs.value.length === 0 && isTrulyEmpty) {
         emit('upload-click');
       }
@@ -1775,7 +1925,7 @@ onMounted(async () => {
     resolveScrollTarget();
     
     // After resolveScrollTarget: if all orbs dismissed, scroll to gallery (overrides snap-to-0)
-    if (orbs.value.length === 0 && galleryItems.value.some(item => item.status === 'left' || item.status === 'right')) {
+    if (orbs.value.length === 0 && hasDismissedOrbs.value) {
       scrollAnchorVel.value = 0;
       scrollTarget.value = 1;
       pendingScrollToGallery.value = false;
@@ -1841,6 +1991,12 @@ onMounted(async () => {
       keyPressedShift.value = true;
     } else if (keyEvent.code == 'AltLeft' || keyEvent.code == 'AltRight') {
       keyPressedAlt.value = true;
+    }
+    
+    // Debug toggle
+    if ((keyEvent.metaKey || keyEvent.ctrlKey) && keyEvent.code === 'KeyD') {
+      keyEvent.preventDefault();
+      showDebugMenu.value = !showDebugMenu.value;
     }
   });
   document.addEventListener('keyup', (keyEvent) => {
@@ -1933,13 +2089,11 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
     uploadedImageElements.value = [];
     orbs.value = [];
     activeImageIndex.value = 0;
-    // Dismissed orbs: any items with status 'left' or 'right'
-    const hasDismissedOrbs = galleryItems.value.some(item => item.status === 'left' || item.status === 'right');
-    // Truly empty: no gallery items AND no items with status left/right
-    const isTrulyEmpty = galleryItems.value.length === 0 && !hasDismissedOrbs;
+    // Truly empty: no orbs AND no dismissed orbs in gallery
+    const isTrulyEmpty = orbs.value.length === 0 && !hasDismissedOrbs.value;
 
     // When there are dismissed orbs (gallery), smooth-scroll to gallery screen; otherwise reset
-    if (hasDismissedOrbs) {
+    if (hasDismissedOrbs.value) {
       // Use scrollTarget so the spring physics animate smoothly to the gallery position
       scrollAnchorVel.value = 0;
       scrollTarget.value = 1; // gallery sits at orbs.length + 1 = 0 + 1 = 1
@@ -1974,49 +2128,94 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
        />
     </div>
 
-    <!-- Grid Gallery -->
+    <!-- Interpolated Gallery View -->
     <div
-       v-if="galleryItems.length > 0"
-       class="absolute left-1/2 w-[90vw] max-w-md grid grid-cols-3 gap-3 p-4 transition-all duration-500 ease-out"
+       v-if="hasDismissedOrbs"
+       class="absolute inset-0 z-[100] pointer-events-none"
        :style="{
-          top: '50%',
-          left: '50%',
-          transform: `translate(-50%, -50%) translateY(${(orbs.length + 1 - scrollAnchor) * ORB_SPACING}px)`,
-          opacity: Math.abs(orbs.length + 1 - scrollAnchor) < 0.5 ? 1 : 0,
-          zIndex: 100,
+          opacity: Math.min(1, Math.max(0, (scrollAnchor - orbs.length) * 2)), 
           pointerEvents: scrollAnchor > orbs.length - 0.5 ? 'auto' : 'none'
        }"
     >
+        <!-- Headers -->
+        <div 
+            class="absolute top-0 left-0 w-1/2 h-full flex justify-center pt-20 pointer-events-none"
+            :style="{ opacity: Math.max(0, Math.min(1, (scrollAnchor - (orbs.length + 1.2)) * 4)) }"
+        >
+            <h3 class="text-black font-light text-lg tracking-widest uppercase sticky top-20 h-min block">Real</h3>
+        </div>
+        <div 
+            class="absolute top-0 right-0 w-1/2 h-full flex justify-center pt-20 pointer-events-none"
+            :style="{ opacity: Math.max(0, Math.min(1, (scrollAnchor - (orbs.length + 1.2)) * 4)) }"
+        >
+            <h3 class="text-black font-light text-lg tracking-widest uppercase sticky top-20 h-min block">Fake</h3>
+        </div>
+
+       <!-- Dynamic Items -->
        <div 
-         v-for="item in galleryItems" 
+         v-for="(item, index) in dismissedGalleryItems" 
          :key="item.id"
-         class="relative aspect-square rounded-full overflow-hidden transition-transform bg-neutral-800"
-         :class="[
-            item.status === 'active' ? 'cursor-pointer hover:scale-105 active:scale-95 opacity-70' : ''
-         ]"
+         class="rounded-full overflow-hidden bg-neutral-800 shadow-xl transition-transform duration-75 pointer-events-auto"
+         :style="getGalleryItemStyle(item, index)"
          @click.stop="scrollToGalleryItem(item)"
        >
-          <!-- All items show kaleidoscope thumbnail -->
+          <!-- Thumbnail -->
           <img
              :src="item.thumbnailSrc || item.src"
              class="block w-full h-full object-cover"
           />
           
-          <!-- X Overlay for left swipes -->
+          <!-- Overlays -->
           <div 
             v-if="item.status === 'left'" 
-            class="absolute inset-0 flex items-center justify-center"
+            class="absolute inset-0 flex items-center justify-center bg-black/20"
           >
              <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
           </div>
-          
-          <!-- Checkmark Overlay for right swipes -->
           <div 
             v-if="item.status === 'right'" 
-            class="absolute inset-0 flex items-center justify-center"
+            class="absolute inset-0 flex items-center justify-center bg-black/20"
           >
              <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M20 6 9 17l-5-5"/></svg>
           </div>
+       </div>
+       
+
+    </div>
+
+
+    <!-- Debug Menu -->
+    <div 
+      v-if="showDebugMenu" 
+      class="fixed inset-0 z-[9999] bg-black/90 p-4 md:p-8 overflow-auto text-white font-mono flex flex-col items-center"
+      @click.self="showDebugMenu = false"
+    >
+       <div class="w-full max-w-2xl">
+         <div class="flex justify-between items-center mb-6">
+            <h2 class="text-xl font-bold">Debug: Fake/Real Status</h2>
+            <button @click="showDebugMenu = false" class="px-4 py-2 bg-white/10 hover:bg-white/20 rounded">Close (Esc)</button>
+         </div>
+         
+         <div class="grid grid-cols-1 gap-2">
+            <div 
+               v-for="item in galleryItems" 
+               :key="item.id" 
+               class="flex items-center gap-4 bg-white/5 p-3 rounded border border-white/5 hover:border-white/20 transition-colors cursor-pointer select-none"
+               @click="item.isFake = !item.isFake"
+            >
+               <img :src="item.thumbnailSrc || item.src" class="w-16 h-16 rounded bg-black object-cover"/>
+               <div class="flex-1 min-w-0">
+                 <div class="truncate text-xs text-white/50 mb-1">{{ item.id }}</div>
+                 <div class="text-sm font-medium">{{ item.status }}</div>
+               </div>
+               <div :class="item.isFake ? 'bg-red-500/20 text-red-400 border-red-500/50' : 'bg-green-500/20 text-green-400 border-green-500/50'" class="px-3 py-1 rounded border font-bold text-sm min-w-[80px] text-center uppercase">
+                  {{ item.isFake ? 'Fake' : 'Real' }}
+               </div>
+            </div>
+         </div>
+         <div v-if="galleryItems.length === 0" class="text-center text-white/50 py-10">
+            No images loaded
+         </div>
        </div>
     </div>
 
@@ -2032,4 +2231,15 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
 </template>
 
 <style scoped>
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.mask-gradient {
+   mask-image: linear-gradient(to bottom, transparent, black 10px, black calc(100% - 10px), transparent);
+   -webkit-mask-image: linear-gradient(to bottom, transparent, black 10px, black calc(100% - 10px), transparent);
+}
 </style>
