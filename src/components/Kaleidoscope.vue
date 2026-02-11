@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, onMounted, nextTick, useTemplateRef, watch, onUnmounted} from 'vue';
+import {ref, computed, onMounted, nextTick, useTemplateRef, watch, onUnmounted} from 'vue';
 import { ScopeShape } from '../scopeShape.ts';
 
 const props = defineProps<{
@@ -9,7 +9,7 @@ const props = defineProps<{
   uploadedImages?: string[]
 }>();
 
-const emit = defineEmits(['save-frame', 'upload-click', 'remove-uploaded-image', 'gallery-view-change', 'active-orbs-change']);
+const emit = defineEmits(['save-frame', 'upload-click', 'remove-uploaded-image', 'gallery-view-change', 'active-orbs-change', 'gallery-status-change', 'centered-index-change', 'total-gallery-count-change']);
 
 const CLICK_MOVE_THRESHOLD_PX = 10;
 
@@ -76,6 +76,15 @@ const galleryItems = ref<GalleryItem[]>([]);
 const scrollAnchor = ref(0);
 const scrollAnchorVel = ref(0);
 
+// Find the centered orb index (the one closest to scrollAnchor)
+const centeredOrbIndex = computed(() => {
+  if (orbs.value.length === 0) return -1;
+  const rounded = Math.round(scrollAnchor.value);
+  return Math.max(0, Math.min(orbs.value.length - 1, rounded));
+});
+
+// (Text labels removed - buttons now in App.vue)
+
 // Physics Constants
 // Physics Constants
 // Physics Constants
@@ -90,14 +99,13 @@ const scrollTarget = ref<number | null>(null);
 const WHEEL_LOCK_TIMEOUT_MS = 150; // Delay after wheel stops to lock target
 
 const updateLayout = () => {
-    // The requirement: "half hemisphere of the smaller orbs above/below should be visible"
-    // This implies that the spacing between orb centers should be half the viewport height.
-    // So if the center orb is at 0, the next one is at +window.innerHeight/2.
-    // This places the center of the next orb exactly at the bottom edge of the screen.
+    // Spacing adjusted so next/previous orbs are still visible on screen edges
+    // The spacing between orb centers is 55% of viewport height
+    // This keeps adjacent orbs partially visible while maintaining good separation
     
     // We update the reactive constants
     const vh = window.innerHeight;
-    const spacing = vh * 0.5; // distance between centers
+    const spacing = vh * 0.55; // distance between centers
     
     ORB_SPACING.value = spacing;
     
@@ -252,28 +260,36 @@ const computeImpulseFromDelta = (rawDelta: number, isTrackpad: boolean) => {
 
 
 const getOrbStyle = (orb: OrbState) => {
-  // orb.y is pixels from center (0)
-  // We center the orb at 50% of container, then translate by orb.y
-  
-  // Scale effect: Grow slightly when near center?
-  // We can compute this dynamically in the loop or here.
-  // Let's use the current "distance from 0" logic for scale visual
-  const dist = Math.abs(orb.y);
-  // Scale ends at 0.5 (half size) when distance is >= ORB_SPACING
-  // Scale is 1.0 at distance 0
-  const distRatio = Math.min(1.0, dist / ORB_SPACING.value);
-  const scaleFactor = 1.0 - (0.5 * distRatio); // properties: at 0 -> 1.0. at 1 -> 0.5.
-  
-  const visualScale = orb.scale * scaleFactor;
-  
-  // Center Orbit Drag/Dismiss logic (only if active?)
-  // If we want to support dragging ANY orb, we can check IDs.
-  // For now, let's just apply the transform.
-  
+  // 3D layered stack: orb.y / ORB_SPACING gives "depth" (0=front, 1=one behind, etc.)
+  const depth = orb.y / (ORB_SPACING.value || 1);
+  const maxVisibleBehind = 2; // Show up to 2 orbs behind the front
+
+  // Scale: decreases by ~8.3% per depth step (Figma ratios: 327→300→270)
+  const clampedDepth = Math.max(0, depth);
+  const visualScale = Math.max(0.3, 1.0 - clampedDepth * 0.083) * orb.scale;
+
+  // Vertical offset: shift upward for behind orbs (~13% of orb height per step)
+  const yOffset = -clampedDepth * ORB_HEIGHT_PX.value * 0.13;
+
+  // Z-index: front is highest
+  const zIndex = Math.round(100 - clampedDepth * 10);
+
+  // Opacity: hide orbs that are past the front or too far behind
+  let opacity = 1.0;
+  if (depth < -0.3) {
+    opacity = Math.max(0, 1 + (depth + 0.3) * 3);
+  } else if (depth > maxVisibleBehind + 0.5) {
+    opacity = Math.max(0, 1 - (depth - maxVisibleBehind - 0.5) * 3);
+  }
+
+  // Horizontal offset from drag/dismiss gesture
+  const translateX = orb.x;
+
   return {
      top: '50%',
-     transform: `translate(-50%, -50%) translate(${orb.x}px, ${orb.y}px) scale(${visualScale})`,
-     zIndex: Math.round(100 - dist / 10), // closer -> higher z-index
+     transform: `translate(-50%, -50%) translate(${translateX}px, ${yOffset}px) scale(${visualScale})`,
+     zIndex,
+     opacity: Math.max(0, Math.min(1, opacity)),
   };
 };
 
@@ -309,60 +325,83 @@ const loadUploadedImages = async (imageSrcs: string[]) => {
     const loadedOrbs: OrbState[] = [];
     let index = 0;
     for (const src of imageSrcs) {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.src = src;
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
-      });
-      const resizedImg = await resizeImage(img);
-      
-      // Initialize orb state
-      // Initial position: stacked vertically based on index
-      // Target position will be calculated in the physics loop
-      // Reconcile with gallery items
-      let galleryId = '';
-      const existingItem = galleryItems.value.find(item => item.src === src && item.status === 'active' && !loadedOrbs.some(o => o.galleryId === item.id));
-      
-      if (existingItem) {
-        galleryId = existingItem.id;
-      } else {
-        galleryId = `gallery-${Date.now()}-${index}`;
+      try {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.src = src;
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = () => reject(new Error(`Failed to load image: ${src.substring(0, 50)}...`));
+        });
+        const resizedImg = await resizeImage(img);
         
-        // Generate baked thumbnail if possible (normal size for active items)
-        let thumb = undefined;
-        if (bakeKaleidoscopeThumbnail) {
-             try {
-                thumb = bakeKaleidoscopeThumbnail(resizedImg, 'in');
-             } catch (e) {
-                console.error("Failed to bake thumbnail", e);
-             }
+        // Initialize orb state
+        // Initial position: stacked vertically based on index
+        // Target position will be calculated in the physics loop
+        // Reconcile with gallery items
+        let galleryId = '';
+        // First try to find an active item that's not already in loadedOrbs
+        let existingItem = galleryItems.value.find(item => item.src === src && item.status === 'active' && !loadedOrbs.some(o => o.galleryId === item.id));
+        
+        // If not found, look for any item with this src (could be swiped left/right)
+        if (!existingItem) {
+          existingItem = galleryItems.value.find(item => item.src === src && !loadedOrbs.some(o => o.galleryId === item.id));
         }
         
-        galleryItems.value.push({
-          id: galleryId,
-          src: src,
-          img: resizedImg, 
-          thumbnailSrc: thumb,
-          originalSrc: src,
-          status: 'active'
-        });
-      }
+        if (existingItem) {
+          galleryId = existingItem.id;
+          // Reset status to active if it was swiped
+          if (existingItem.status !== 'active') {
+            existingItem.status = 'active';
+            // Rebake thumbnail to normal size
+            if (existingItem.img && bakeKaleidoscopeThumbnail) {
+              try {
+                existingItem.thumbnailSrc = bakeKaleidoscopeThumbnail(existingItem.img, 'in');
+              } catch (e) {
+                console.error("Failed to rebake thumbnail on restore", e);
+              }
+            }
+          }
+        } else {
+          galleryId = `gallery-${Date.now()}-${index}`;
+          
+          // Generate baked thumbnail if possible (normal size for active items)
+          let thumb = undefined;
+          if (bakeKaleidoscopeThumbnail) {
+               try {
+                  thumb = bakeKaleidoscopeThumbnail(resizedImg, 'in');
+               } catch (e) {
+                  console.error("Failed to bake thumbnail", e);
+               }
+          }
+          
+          galleryItems.value.push({
+            id: galleryId,
+            src: src,
+            img: resizedImg, 
+            thumbnailSrc: thumb,
+            originalSrc: src,
+            status: 'active'
+          });
+        }
 
-      loadedOrbs.push({
-        id: `orb-${Date.now()}-${index}`,
-        img: resizedImg,
-        x: 0,
-        y: index * ORB_SPACING.value, // Initial placement
-        vy: 0,
-        scale: 1,
-        rotation: 0,
-        rotationVel: 0,
-        texture: createTextureFromImage(resizedImg),
-        galleryId: galleryId
-      });
-      index++;
+        loadedOrbs.push({
+          id: `orb-${Date.now()}-${index}`,
+          img: resizedImg,
+          x: 0,
+          y: index * ORB_SPACING.value, // Initial placement
+          vy: 0,
+          scale: 1,
+          rotation: 0,
+          rotationVel: 0,
+          texture: createTextureFromImage(resizedImg),
+          galleryId: galleryId
+        });
+        index++;
+      } catch (error) {
+        console.error(`Failed to load image at index ${index}:`, error);
+        // Continue with next image instead of failing completely
+      }
     }
     
     // Update State
@@ -1163,8 +1202,8 @@ async function main(canvasElement: HTMLCanvasElement) {
         orb.rotation += orb.rotationVel;
         orb.rotationVel *= 0.98; // Angular Drag
         
-        // Render if visible (gross culling)
-        if (Math.abs(orb.y) < window.innerHeight) { 
+        // Render if visible (wider range for 3D stack layout)
+        if (Math.abs(orb.y) < window.innerHeight * 2) { 
              visibleOrbs.push(orb);
         }
     }
@@ -1351,7 +1390,11 @@ const dismissActiveOrb = async (direction: 1 | -1, removeIndex: number) => {
   // Find the gallery item
   const galleryItem = galleryItems.value.find(item => item.id === orb.galleryId);
   if (galleryItem) {
-    galleryItem.status = direction === 1 ? 'right' : 'left';
+    const previousStatus = galleryItem.status;
+    // direction 1 (right) → Real Memory (checkmark), direction -1 (left) → AI Slop (X)
+    galleryItem.status = direction === 1 ? 'left' : 'right';
+    // Emit status change for undo tracking
+    emit('gallery-status-change', galleryItem.id, previousStatus);
     
     // Rebake thumbnail for both swipes (larger scope size for clearer view)
     if (galleryItem.img && bakeKaleidoscopeThumbnail) {
@@ -1400,7 +1443,11 @@ const removeUploadedImageAtIndex = (index: number) => {
   if (activeImageIndex.value >= uploadedImageElements.value.length) {
     activeImageIndex.value = Math.max(0, uploadedImageElements.value.length - 1);
   }
-  // No syncSlotIndices needed, physics handles it
+
+  // If no more orbs, auto-scroll to gallery
+  if (orbs.value.length === 0 && galleryItems.value.length > 0) {
+    scrollTarget.value = 1;
+  }
 };
 
 
@@ -1614,8 +1661,15 @@ function touchCancelCallback() {
 }
 
 const scrollToOrb = (index: number) => {
-  scrollAnchor.value = index;
+  // Instant snap - no animation to avoid conflicts with orb restoration logic
+  const clamped = Math.max(0, Math.min(orbs.value.length + 1, index));
+  scrollAnchor.value = clamped;
+  scrollTarget.value = clamped;
   scrollAnchorVel.value = 0;
+};
+
+const findOrbIndexByGalleryId = (galleryId: string): number => {
+  return orbs.value.findIndex(orb => orb.galleryId === galleryId);
 };
 
 const scrollToGalleryItem = (item: GalleryItem) => {
@@ -1653,6 +1707,16 @@ onMounted(async () => {
   // Watch for active orbs count
   watch(() => orbs.value.length, (count) => {
     emit('active-orbs-change', count);
+  }, { immediate: true });
+
+  // Watch for centered orb index changes
+  watch(centeredOrbIndex, (idx) => {
+    emit('centered-index-change', idx);
+  }, { immediate: true });
+
+  // Watch for total gallery count changes
+  watch(() => galleryItems.value.length, (count) => {
+    emit('total-gallery-count-change', count);
   }, { immediate: true });
 
 
@@ -1960,6 +2024,48 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
   }
 }, { immediate: false });
 
+// Expose method to reset gallery status
+const resetGalleryStatus = (galleryId: string) => {
+  const galleryItem = galleryItems.value.find(item => item.id === galleryId);
+  if (galleryItem) {
+    galleryItem.status = 'active';
+    // Rebake thumbnail back to normal size
+    if (galleryItem.img && bakeKaleidoscopeThumbnail) {
+      try {
+        galleryItem.thumbnailSrc = bakeKaleidoscopeThumbnail(galleryItem.img, 'in');
+      } catch (e) {
+        console.error('Failed to rebake thumbnail on undo', e);
+      }
+    }
+  }
+};
+
+// Dismiss the current front orb programmatically (for button taps)
+const dismissCurrentOrb = async (direction: 1 | -1) => {
+  if (orbs.value.length === 0) return;
+  const idx = centeredOrbIndex.value;
+  if (idx < 0 || idx >= orbs.value.length) return;
+  await dismissActiveOrb(direction, idx);
+};
+
+// Clear all gallery data (for close/reset)
+const clearGallery = () => {
+  galleryItems.value = [];
+  orbs.value = [];
+  uploadedImageElements.value = [];
+  scrollAnchor.value = 0;
+  scrollAnchorVel.value = 0;
+  scrollTarget.value = null;
+};
+
+defineExpose({
+  resetGalleryStatus,
+  scrollToOrb,
+  findOrbIndexByGalleryId,
+  dismissCurrentOrb,
+  clearGallery
+});
+
 </script>
 
 <template>
@@ -1970,12 +2076,16 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
       class="absolute inset-0 z-[200] touch-none select-none"
     />
 
-    <!-- Dynamic Orbs List -->
+    <!-- Dynamic Orbs List (3D layered stack) -->
     <div 
        v-for="orb in orbs" 
        :key="orb.id"
        class="absolute left-1/2 overflow-hidden rounded-full bg-neutral-800 w-[64vmin] h-[64vmin] min-w-[160px] min-h-[160px]"
-       :style="getOrbStyle(orb)"
+       :style="{
+         ...getOrbStyle(orb),
+         border: '4px solid white',
+         boxShadow: '0 8px 24px rgba(0, 0, 0, 0.12)',
+       }"
     >
        <canvas
           :ref="(el) => setCanvasRef(el, orb.id)"
@@ -2011,20 +2121,20 @@ watch(() => props.uploadedImages, async (newImages, oldImages) => {
              class="block w-full h-full object-cover"
           />
           
-          <!-- X Overlay for left swipes -->
+          <!-- Checkmark Overlay for left swipes -->
           <div 
             v-if="item.status === 'left'" 
             class="absolute inset-0 flex items-center justify-center"
           >
-             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M20 6 9 17l-5-5"/></svg>
           </div>
           
-          <!-- Checkmark Overlay for right swipes -->
+          <!-- X Overlay for right swipes -->
           <div 
             v-if="item.status === 'right'" 
             class="absolute inset-0 flex items-center justify-center"
           >
-             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M20 6 9 17l-5-5"/></svg>
+             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="drop-shadow-lg"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
           </div>
        </div>
     </div>
